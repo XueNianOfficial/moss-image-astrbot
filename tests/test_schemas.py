@@ -110,12 +110,29 @@ def test_config_coerces_lists_and_bools():
 
 
 def test_example_toml_parses_and_validates():
-    example = Path(__file__).resolve().parents[1] / "config.example.toml"
+    # Hermetic: the example ships with placeholder paths, so point them at a
+    # throwaway ai-toolkit / model layout instead of the developer's machine.
+    import tempfile
+
+    root = Path(tempfile.mkdtemp(prefix="moss-config-"))
+    aitk = root / "ai-toolkit"
+    (aitk / "toolkit").mkdir(parents=True)
+    (aitk / "extensions_built_in").mkdir()
+    model = root / "model"
+    (model / "transformer").mkdir(parents=True)
+    (model / "model_index.json").write_text("{}", encoding="utf-8")
+
+    source = (Path(__file__).resolve().parents[1] / "config.example.toml").read_text(encoding="utf-8")
+    source = source.replace('aitk_root = "G:/ai-toolkit"', f'aitk_root = "{aitk.as_posix()}"')
+    source = source.replace('model_dir = "G:/model"', f'model_dir = "{model.as_posix()}"')
+    example = root / "config.toml"
+    example.write_text(source, encoding="utf-8")
+
     config = load_config(example, None).resolve(Path.cwd()).validate()
     assert config.aitk_root and Path(config.aitk_root, "toolkit").is_dir()
     assert Path(config.model_dir, "transformer").is_dir()
     assert config.validate() is config
-    print(f"  model_dir={config.model_dir} qtype={config.qtype} loras={len(config.loras)}")
+    print(f"  config.example.toml valid (paths substituted) qtype={config.qtype}")
 
 
 def _run() -> int:
