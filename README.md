@@ -1,5 +1,9 @@
 # MOSS-Image 本地推理服务 + AstrBot 绘图插件
 
+[![ci](https://github.com/XueNianOfficial/moss-image-astrbot/actions/workflows/ci.yml/badge.svg)](https://github.com/XueNianOfficial/moss-image-astrbot/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/XueNianOfficial/moss-image-astrbot?include_prereleases)](https://github.com/XueNianOfficial/moss-image-astrbot/releases)
+[![license](https://img.shields.io/github/license/XueNianOfficial/moss-image-astrbot)](LICENSE)
+
 在**消费级显卡（12 GiB 起）**上跑 [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT)
 的本地 HTTP 服务，并附带一个让 AstrBot 能自主画图的插件：
 
