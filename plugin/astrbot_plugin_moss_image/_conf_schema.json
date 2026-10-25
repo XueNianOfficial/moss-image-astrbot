@@ -1,0 +1,258 @@
+{
+  "server": {
+    "description": "MOSS-Image 服务连接",
+    "type": "object",
+    "hint": "指向本机运行的 MOSS-Image 服务。默认端口 8000，由开机自启项启动。",
+    "items": {
+      "base_url": {
+        "description": "服务地址",
+        "type": "string",
+        "default": "http://127.0.0.1:8000",
+        "hint": "例如 http://127.0.0.1:8000，需包含 http:// 前缀",
+        "obvious_hint": true
+      },
+      "api_key": {
+        "description": "API Key",
+        "type": "string",
+        "default": "",
+        "hint": "仅当服务端用 --api-key 启动时填写，两边必须一致；留空表示不需要鉴权"
+      },
+      "timeout": {
+        "description": "生成超时（秒）",
+        "type": "int",
+        "default": 900,
+        "slider": {
+          "min": 60,
+          "max": 1800,
+          "step": 30
+        },
+        "hint": "1024x1024 / 30 步通常 40-90 秒；首次请求还要加载模型。超时会提示失败。",
+        "obvious_hint": true
+      }
+    }
+  },
+  "generation": {
+    "description": "默认生成参数（采样方式）",
+    "type": "object",
+    "hint": "用户没有在命令里指定时使用的默认值。--size/--steps/--seed 可临时覆盖。",
+    "items": {
+      "width": {
+        "description": "默认宽度",
+        "type": "int",
+        "default": 1024,
+        "slider": {
+          "min": 256,
+          "max": 2048,
+          "step": 16
+        },
+        "hint": "必须是 16 的倍数"
+      },
+      "height": {
+        "description": "默认高度",
+        "type": "int",
+        "default": 1024,
+        "slider": {
+          "min": 256,
+          "max": 2048,
+          "step": 16
+        },
+        "hint": "必须是 16 的倍数"
+      },
+      "steps": {
+        "description": "默认采样步数",
+        "type": "int",
+        "default": 30,
+        "slider": {
+          "min": 4,
+          "max": 100,
+          "step": 1
+        },
+        "hint": "官方建议 Base 模型 50 步；SFT+LoRA 用 30 步已经不错，12-20 步可以更快出草稿"
+      },
+      "guidance": {
+        "description": "默认引导强度（CFG）",
+        "type": "float",
+        "default": 3.0,
+        "slider": {
+          "min": 1.0,
+          "max": 8.0,
+          "step": 0.5
+        },
+        "hint": "MOSS-Image 默认 3.0；设为 1.0 会关闭 CFG，速度快一倍但更贴合提示词"
+      },
+      "negative_prompt": {
+        "description": "默认负面提示词",
+        "type": "string",
+        "default": "low quality, blurry, watermark, text, extra limbs, deformed, jpeg artifacts",
+        "hint": "每次出图都会带上的排除项；命令里的 --no 会追加在后面。留空表示不排除",
+        "obvious_hint": true
+      },
+      "shift": {
+        "description": "采样 shift（flow-matching）",
+        "type": "float",
+        "default": 0.0,
+        "slider": {
+          "min": 0.0,
+          "max": 12.0,
+          "step": 0.5
+        },
+        "hint": "0 = 跟随服务端（官方默认 5.0）；调低更贴近训练分布、细节更足，调高构图更自由"
+      },
+      "uncond_skip_layers": {
+        "description": "CFG 跳过的 DiT 层",
+        "type": "string",
+        "default": "22",
+        "hint": "留空 = 跟随服务端；填 off 表示不跳过（速度减半）；多个用逗号，例如 22,24。官方默认跳过第 22 层"
+      },
+      "max_images": {
+        "description": "单次最多生成张数",
+        "type": "int",
+        "default": 2,
+        "slider": {
+          "min": 1,
+          "max": 4,
+          "step": 1
+        },
+        "hint": "多张会串行生成，耗时成倍增加"
+      }
+    }
+  },
+  "enhance": {
+    "description": "Prompt Enhancer（提示词增强）",
+    "type": "object",
+    "hint": "用当前对话的 LLM 把简短描述扩写成详细的英文画面描述，遵循 MOSS-Image 官方 prompt enhancer 规则。",
+    "items": {
+      "enabled": {
+        "description": "启用提示词增强",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后一律按用户原文出图（等同 --raw）"
+      },
+      "auto_enhance_below": {
+        "description": "自动增强的字符阈值",
+        "type": "int",
+        "default": 60,
+        "slider": {
+          "min": 0,
+          "max": 300,
+          "step": 10
+        },
+        "hint": "描述短于这个长度时自动增强；长描述默认原样使用。--enhance 始终增强，--raw 从不增强"
+      },
+      "max_prompt_chars": {
+        "description": "增强结果最大字符数",
+        "type": "int",
+        "default": 1400,
+        "slider": {
+          "min": 200,
+          "max": 4000,
+          "step": 100
+        },
+        "hint": "MOSS-Image 支持最长 4096 token 的提示词，一般 1000-1500 字符足够"
+      }
+    }
+  },
+  "layout": {
+    "description": "Layout Enhancer（布局/排版增强）",
+    "type": "object",
+    "hint": "适合海报、封面、带标题或需要精确摆放元素的图：LLM 只写像素框草稿，坐标换算与校验交给官方 compile_prompt。",
+    "items": {
+      "enabled": {
+        "description": "启用布局增强",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后 --layout 会退化为普通提示词"
+      },
+      "max_retries": {
+        "description": "校验失败后的重试次数",
+        "type": "int",
+        "default": 2,
+        "slider": {
+          "min": 0,
+          "max": 5,
+          "step": 1
+        },
+        "hint": "LLM 给出的框超出画布或字段不合法时，会把错误回传让它重写"
+      }
+    }
+  },
+  "lora": {
+    "description": "LoRA 目录",
+    "type": "object",
+    "hint": "每行一条 LoRA：名称 | 文件路径 | 是否默认启用 | 权重 | 描述 | 触发词。插件启动时把它们注册到服务端；AI 会读描述自动决定用不用、用多重。",
+    "items": {
+      "enabled": {
+        "description": "启用 LoRA 功能",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后所有 LoRA 权重按 0 处理（--lora 也会被忽略）"
+      },
+      "allow_bot_choice": {
+        "description": "允许 AI 自主选择 LoRA",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后会把下面的描述注入系统提示，LLM 可在调用绘图工具时自行指定 LoRA 与权重"
+      },
+      "max_weight": {
+        "description": "AI 可设置的最大权重",
+        "type": "float",
+        "default": 1.0,
+        "slider": {
+          "min": 0.1,
+          "max": 2.0,
+          "step": 0.1
+        },
+        "hint": "超过 1.0 容易过拟合风格；仅在需要强化特征时调高"
+      },
+      "catalog_lines": {
+        "description": "LoRA 列表",
+        "type": "string",
+        "default": "",
+        "hint": "格式：名称 | 文件路径 | on/off | 权重 | 描述 | 触发词；多条用分号 ; 分隔，# 开头为注释。描述越具体，AI 越知道什么时候该用",
+        "obvious_hint": true
+      }
+    }
+  },
+  "behaviour": {
+    "description": "使用行为",
+    "type": "object",
+    "hint": "权限、冷却与回复细节。",
+    "items": {
+      "admin_only": {
+        "description": "仅管理员可用",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后只有管理员能触发生图命令与 LLM 工具"
+      },
+      "cooldown": {
+        "description": "个人冷却（秒）",
+        "type": "int",
+        "default": 10,
+        "slider": {
+          "min": 0,
+          "max": 300,
+          "step": 5
+        },
+        "hint": "同一用户两次 /draw 的最小间隔；0 表示不限制"
+      },
+      "send_progress": {
+        "description": "先发一条「正在生成」提示",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后只在出图完成时回复"
+      },
+      "send_parameters": {
+        "description": "在图片后附带参数",
+        "type": "bool",
+        "default": true,
+        "hint": "显示尺寸、步数、seed 与启用的 LoRA，方便复现"
+      },
+      "inject_tool_guidance": {
+        "description": "向 LLM 注入绘图工具提示",
+        "type": "bool",
+        "default": true,
+        "hint": "部分人设会阻止模型调用工具；开启后在系统提示里提醒它可以直接画图"
+      }
+    }
+  }
+}

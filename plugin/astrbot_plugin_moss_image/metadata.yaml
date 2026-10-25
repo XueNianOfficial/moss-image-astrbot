@@ -1,0 +1,18 @@
+name: astrbot_plugin_moss_image
+display_name: MOSS-Image 绘图
+short_desc: 调用本机 MOSS-Image 服务出图，支持提示词增强与 Layout 排版
+desc: >-
+  通过本机 MOSS-Image 服务（ai-toolkit 推理引擎，int8 量化，LoRA 动态挂载）生成图片。
+  支持画面尺寸/步数/种子/负面提示词，Prompt Enhancer 自动把简短描述扩写成
+  详细英文提示词，Layout Enhancer 把带文字定位的需求编译成 MOSS-Image 的
+  Layout JSON；并注册 LLM 工具，让 AI 可以自主调用绘图。
+version: 1.1.0
+author: DeepSeek Harness
+repo: https://github.com/XueNianOfficial/moss-image-astrbot
+astrbot_version: ">=4.16,<5"
+tags:
+  - 绘图
+  - MOSS-Image
+  - 提示词增强
+  - Layout
+  - AI绘画

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local install artefacts
+config.toml
+config.toml.bak-*
+.install.json
+.install.sh.log
+
+# Model bundle / clones (both are downloaded by install.ps1 / install.sh)
+.models/
+.ai-toolkit/
+
+# Runtime output
+outputs/
+logs/
+data/
+.cache/
+*.out.log
+*.err.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

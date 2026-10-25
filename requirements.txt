@@ -1,0 +1,18 @@
+# Server runtime requirements.
+#
+# torch is NOT listed here on purpose: install.ps1 / install.sh first install the
+# CUDA build that matches your driver, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# (torch >= 2.9 is required by MOSS-Image / ai-toolkit).
+# Installing this file afterwards will keep the CUDA build that is already there.
+
+accelerate>=1.0
+diffusers>=0.38
+transformers>=5.3
+safetensors>=0.4
+huggingface_hub>=0.30
+pillow>=10
+numpy>=1.26
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7

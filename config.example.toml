@@ -1,0 +1,75 @@
+# MOSS-Image API server - example configuration.
+#
+# Copy to config.toml (install.ps1 / install.sh do this for you and fill in the
+# paths) and start with:  python -m moss_server --config config.toml
+# Every key is optional; CLI flags override this file, and MOSS_<KEY>
+# environment variables sit in between the file and the CLI.
+#
+# The model is served through ai-toolkit's inference engine: int8 convrot8
+# weights, layer offloading for low VRAM, and LoRA attached through forward
+# hooks (nothing is merged into the base weights).
+
+[server]
+# ai-toolkit checkout that provides the inference engine + MOSS-Image model.
+aitk_root = "G:/ai-toolkit"
+
+# Plain bf16 diffusers bundle (transformer/, text_encoder/, tokenizer/, vae/).
+# Download with:  hf download OpenMOSS-Team/MOSS-Image-SFT --local-dir <dir>
+model_dir = "G:/model"
+dtype = "bf16"
+# Optional explicit VAE safetensors; empty = <model_dir>/vae/diffusion_pytorch_model.safetensors
+vae_path = ""
+
+host = "127.0.0.1"
+port = 8000
+
+# --- quantisation / memory ------------------------------------------------
+# convrot8 = ai-toolkit's int8 weight quantisation (what its training runs use).
+quantize = true
+qtype = "convrot8"
+quantize_te = true
+qtype_te = "convrot8"
+
+# low_vram keeps components in RAM between requests.
+low_vram = true
+layer_offloading = true
+# Fraction of layers streamed from RAM during a forward pass.
+# 0.0 = transformer stays resident once used, 1.0 = fully offloaded (slowest,
+# lowest VRAM). Raise this to share the card with training.
+layer_offloading_transformer_percent = 0.0
+layer_offloading_text_encoder_percent = 1.0
+
+# --- lifecycle ------------------------------------------------------------
+lazy_load = true
+idle_unload_seconds = 600
+warmup = true
+generation_timeout = 900.0
+queue_timeout = 900.0
+
+# --- generation defaults --------------------------------------------------
+default_steps = 30
+default_guidance_scale = 3.0
+default_height = 1024
+default_width = 1024
+default_max_sequence_length = 4096
+# MOSS-Image skips DiT block 22 in the unconditional branch (official default).
+default_uncond_skip_layers = [22]
+# Flow-matching sigma shift (the vendor default is 5.0).
+default_shift = 5.0
+max_pixels = 4194304
+
+# --- LoRA -----------------------------------------------------------------
+# Paths registered at startup. The AstrBot plugin declares its own catalog via
+# POST /v1/loras/load, so this can stay empty.
+loras = []
+lora_scale = 0.7
+# "hook" = forward hooks, nothing merged into the weights.
+lora_mode = "hook"
+# Scanned by GET /v1/loras.
+lora_dirs = []
+
+# --- HTTP -----------------------------------------------------------------
+api_key = ""
+output_dir = "./outputs"
+public_base_url = ""
+log_level = "info"

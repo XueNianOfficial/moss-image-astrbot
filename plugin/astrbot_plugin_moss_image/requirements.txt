@@ -1,0 +1,14 @@
+# 依赖说明
+
+插件只使用 AstrBot 运行时自带的 `aiohttp` 与标准库，**无需额外安装**。
+
+- `aiohttp`：AstrBot 核心已依赖
+- `compile_prompt.py`：已于 2026-10-20 从
+  `G:\MOSS-Image\skills\moss-image-prompt-enhancer\scripts\compile_prompt.py`
+  原样内置（Apache-2.0，OpenMOSS/MOSS-Image）
+
+若插件加载时报缺少 `aiohttp`，在 AstrBot 的 Python 环境中执行：
+
+```bash
+pip install aiohttp
+```

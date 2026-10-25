@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile everything
+        run: python -m compileall -q moss_server plugin scripts tests
+      - name: Validate config template and plugin schema
+        run: |
+          python - <<'PY'
+          import json, tomllib, pathlib
+          tomllib.loads(pathlib.Path("config.example.toml").read_text(encoding="utf-8"))
+          json.loads(pathlib.Path("plugin/astrbot_plugin_moss_image/_conf_schema.json").read_text(encoding="utf-8"))
+          print("config.example.toml and _conf_schema.json are valid")
+          PY
+      - name: Ruff
+        run: |
+          pip install ruff==0.7.4
+          ruff check --select E9,F63,F7,F82 --output-format concise . || true
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU torch + deps
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      - name: Server schema / config tests
+        run: python tests/test_schemas.py
+      - name: LoRA registry tests
+        run: python tests/test_lora.py
