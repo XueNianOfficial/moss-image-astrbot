@@ -61,6 +61,30 @@ python -m moss_server --config config.toml --port 8000
 
 同一个文件只会有一条注册（按路径去重）；请求里出现未注册的名字会返回 **400**。
 
+### 图像参考编辑（Moss-Image-Edit）
+
+改图走独立进程（`moss_server/edit_worker.py`），因为官方 transformer 的参考图分支与
+ai-toolkit 的量化引擎无法共用一个解释器。两个路径都留空即关闭改图。
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `edit_enabled` | `true` | 总开关；`--no-edit` 亦可 |
+| `edit_repo` | `""` | [Moss-Image-Edit](https://github.com/Chenkin-x/Moss-Image-Edit) 检出目录（需含 `moss_edit/`） |
+| `edit_adapter` | `""` | 编辑 LoRA 目录：`adapter_config.json` + `adapter_model.safetensors` |
+| `edit_python` | `""` | worker 的解释器；留空 = 服务端自己的解释器 |
+| `edit_steps` / `edit_guidance_scale` | `20` / `4.0` | 默认步数与 CFG（官方示例常用 12-50 / 4.0） |
+| `edit_shift` | `5.0` | 采样 shift |
+| `edit_max_ref_images` | `4` | 参考图上限（1-8） |
+| `edit_max_edge` | `1024` | 参考图缩放后的长边 |
+| `edit_idle_unload_seconds` | `600` | worker 空闲多久退出；`0` = 一直驻留 |
+| `edit_free_t2i` | `true` | 启动 worker 前先卸载文生图引擎（反方向也成立） |
+| `edit_timeout` | `900` | 单次改图（含 worker 冷启动）的超时 |
+
+CLI：`--edit-repo`、`--edit-adapter`、`--no-edit`、`--edit-idle-unload`、`--no-edit-free-t2i`。
+
+改图会占用约 11-12 GiB 显存（bf16 全精度 + LoRA，不做量化），因为编辑 LoRA 是在干净权重上训练的。
+显存不够时把 `edit_max_edge` 降到 768，或把 `edit_free_t2i` 保持 `true`。
+
 ### HTTP
 
 `host`、`port`、`api_key`（非空则要求 `Authorization: Bearer <key>`）、
@@ -79,11 +103,35 @@ python -m moss_server --config config.toml --port 8000
 | | `negative_prompt` | **默认负面提示词**，每次出图都带 |
 | | `shift` | `0`=跟随服务端；调低更贴近训练分布 |
 | | `uncond_skip_layers` | 默认 `22`；`off`=不跳过（速度减半） |
-| `enhance` | `enabled` `auto_enhance_below` `max_prompt_chars` | 提示词增强 |
+| `enhance` | `enabled` `auto_enhance_below` `max_prompt_chars` | 是否自动改写短描述（默认 `false`） |
+| `skill` | `enabled` `path` `sections` `max_chars` `guidance` `timeout` | 提示词 skill（见下） |
+| `edit` | `enabled` `max_images` | 改图开关与参考图上限 |
 | `layout` | `enabled` `max_retries` | 布局增强 |
 | `lora` | `enabled` `allow_bot_choice` `max_weight` | LoRA 总开关与 AI 决策权限 |
 | | `catalog_lines` | LoRA 目录文本（见下） |
 | `behaviour` | `admin_only` `cooldown` `send_progress` `send_parameters` | 使用行为 |
+
+### 提示词 skill
+
+插件**不内置**任何提示词规则。规则来自
+[moss-image-prompt-skill](https://github.com/Moeblack/moss-image-prompt-skill)（CC BY-NC-ND 4.0），
+运行时从磁盘读取：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `skill.enabled` | `true` | 关掉后既不注入提示，也不做改写 |
+| `skill.path` | `""` | 留空则找 `<AstrBot数据目录>/skills/moss-image-prompt-skill/SKILL.md`；也可直接填文件或目录 |
+| `skill.sections` | `0,1,2,3,10` | 参与改写的章节；留空 = 全文（约 6.6 万字符，较贵） |
+| `skill.max_chars` | `0` | 章节文本上限，`0` = 不截断（默认章节约 1.5 万字符） |
+| `skill.guidance` | `true` | 在系统提示里要求模型出图前先读 SKILL.md |
+| `skill.timeout` | `150` | 改写超时；超时回退原文，不会导致出图失败 |
+
+两条使用路径：
+
+1. **对话模型自己读**（默认）：`guidance` 注入「先读该文件、按章节取用」的指令，模型用文件工具
+   自己读 skill，再带 prompt 调 `moss_draw_image`；
+2. **插件代读**（`--enhance` 或 `enhance.enabled = true`）：插件取 `sections` 指定章节作为
+   system prompt，让 LLM 按 skill 输出 `{"positive","negative","params"}`。
 
 ### LoRA 目录格式
 
@@ -143,4 +191,7 @@ systemctl --user enable --now moss-image
 | `AI_TOOLKIT_DIR` | `run.ps1` / `run.bat` 找 ai-toolkit venv 的位置（`install.ps1` 也会写进 `.install.json`） |
 | `MOSS_AI_MODEL` 等 `MOSS_<KEY>` | 覆盖任意服务端配置项，优先级高于 config.toml |
 | `MOSS_TEST_LORA` | `tests/test_lora.py` 用来测试真实 LoRA 文件 |
-| `ASTRBOT_APP_DIR` / `ASTRBOT_PLUGINS_DIR` | `tests/test_plugin_integration.py` 定位 AstrBot |
+| `MOSS_TEST_SKILL` | `tests/test_prompt_skill.py` / 插件集成测试用来读真实 SKILL.md |
+| `MOSS_TEST_EDIT` | 设为 `1` 时插件集成测试会跑一次真实改图 |
+| `ASTRBOT_APP_DIR` / `ASTRBOT_PLUGINS_DIR` | 集成测试定位 AstrBot 与插件目录 |
+| `MOSS_SERVER_URL` | 集成测试指向的服务地址 |

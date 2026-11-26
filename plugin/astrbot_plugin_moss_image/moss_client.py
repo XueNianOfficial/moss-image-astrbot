@@ -55,6 +55,20 @@ class GenerationOutcome:
         return self.images[0].seed if self.images else None
 
 
+@dataclass
+class EditOutcome:
+    """One edited image plus the parameters the server actually used."""
+
+    data: bytes
+    seed: int | None = None
+    width: int | None = None
+    height: int | None = None
+    seconds: float | None = None
+    steps: int | None = None
+    references: int = 1
+    guidance_scale: float | None = None
+
+
 class MossClient:
     """Talks to ``POST /v1/moss/generate`` on the local server."""
 
@@ -91,11 +105,20 @@ class MossClient:
                 await self._session.close()
             self._session = None
 
-    async def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+    async def _request(
+        self, method: str, path: str, payload: dict | None = None, *, timeout: float | None = None
+    ) -> dict:
         session = await self._get_session()
         url = f"{self.base_url}{path}"
+        # Per-request timeout: aiohttp exposes ClientSession.timeout as a
+        # read-only property in recent releases, so never mutate it.
+        request_timeout = (
+            aiohttp.ClientTimeout(total=float(timeout), connect=self.connect_timeout)
+            if timeout
+            else None
+        )
         try:
-            async with session.request(method, url, json=payload) as response:
+            async with session.request(method, url, json=payload, timeout=request_timeout) as response:
                 text = await response.text()
                 if response.status >= 400:
                     raise MossServerError(self._describe_http_error(response.status, text))
@@ -208,11 +231,7 @@ class MossClient:
         except MossError:
             pass
 
-        if timeout:
-            session = await self._get_session()
-            session.timeout = aiohttp.ClientTimeout(total=timeout, connect=self.connect_timeout)
-
-        data = await self._request("POST", "/v1/moss/generate", payload)
+        data = await self._request("POST", "/v1/moss/generate", payload, timeout=timeout)
         outcome = GenerationOutcome(seconds=data.get("seconds"), state_before=before)
         for item in data.get("data", []):
             encoded = item.get("b64_json")
@@ -230,3 +249,65 @@ class MossClient:
         if not outcome.images:
             raise MossServerError("服务器没有返回图片数据")
         return outcome
+
+    async def edit(
+        self,
+        images: list[bytes],
+        prompt: str,
+        *,
+        negative_prompt: str = "",
+        width: int | None = None,
+        height: int | None = None,
+        size: str | None = None,
+        steps: int | None = None,
+        guidance: float | None = None,
+        seed: int | None = None,
+        shift: float | None = None,
+        max_edge: int | None = None,
+        timeout: float | None = None,
+    ) -> EditOutcome:
+        """Edit reference image(s) with an instruction (Moss-Image-Edit)."""
+        if not images:
+            raise MossServerError("改图至少需要一张参考图片")
+        payload = {
+            "prompt": prompt,
+            "images": [base64.b64encode(image).decode("ascii") for image in images],
+            "negative_prompt": negative_prompt or "",
+            "response_format": "b64_json",
+        }
+        if size:
+            payload["size"] = size
+        if width:
+            payload["width"] = int(width)
+        if height:
+            payload["height"] = int(height)
+        if steps:
+            payload["steps"] = int(steps)
+        if guidance is not None:
+            payload["guidance_scale"] = float(guidance)
+        if seed is not None:
+            payload["seed"] = int(seed)
+        if shift is not None:
+            payload["shift"] = float(shift)
+        if max_edge:
+            payload["max_edge"] = int(max_edge)
+
+        data = await self._request("POST", "/v1/moss/edit", payload, timeout=timeout)
+        items = data.get("data") or []
+        encoded = items[0].get("b64_json") if items else None
+        if not encoded:
+            raise MossServerError("服务器没有返回改图结果")
+        meta = data.get("edit") or {}
+        return EditOutcome(
+            data=base64.b64decode(encoded),
+            seed=items[0].get("seed", data.get("seed")),
+            width=items[0].get("width"),
+            height=items[0].get("height"),
+            seconds=items[0].get("seconds", data.get("seconds")),
+            steps=meta.get("steps"),
+            references=int(meta.get("references") or len(images)),
+            guidance_scale=meta.get("guidance_scale"),
+        )
+
+    async def edit_status(self) -> dict:
+        return await self._request("GET", "/v1/edit/status")

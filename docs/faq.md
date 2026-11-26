@@ -58,11 +58,53 @@ CPU 推理（`-Cpu`）只适合验证接线，一张 1024² 图要几十分钟�
 配置页里都能编辑；若面板显示异常，可直接改
 `~/.astrbot/data/config/astrbot_plugin_moss_image_config.json`（UTF-8）后重载插件。
 
-**Q: 中文提示词可以用吗**
-可以。Prompt Enhancer 会把中文描述扩写成英文散文体；`--raw` 则原样发给模型（模型本身支持中文提示词）。
-
 **Q: 群聊里怎么限制只有管理员能画**
-插件配置 `behaviour.admin_only = true`，同时会限制 LLM 工具调用。
+插件配置 `behaviour.admin_only = true`，同时会限制命令与两个 LLM 工具（画图/改图）。
+
+**Q: 中文提示词可以用吗**
+可以。提示词 skill 会按它自己的规则写成规范提示词；`--raw` 则原样发给模型（模型本身支持中文提示词）。
+
+## 改图（/edit）
+
+**Q: `/edit` 提示「改图功能不可用」或 503**
+服务端必须配好 `edit_repo` 与 `edit_adapter`，并且适配器目录里要有
+`adapter_config.json` + `adapter_model.safetensors`。先 `GET /v1/edit/status` 看 `reason`。
+
+**Q: `/edit` 说没找到图片**
+图片要和指令一起发，或者**引用（回复）**一张带图的消息。部分适配器的引用消息只带 id，
+插件会调 `get_msg` 再取一次；如果仍取不到，请直接把图片和指令放在同一条消息里。
+
+**Q: 第一次改图特别慢**
+worker 冷启动要加载 bf16 全精度 transformer + LoRA（约 18 s），之后同一进程内热请求约 37 s
+（1024²/12 步：编码 18 s + 采样 16 s）。空闲 `edit_idle_unload_seconds` 后 worker 退出，
+下次再付一次冷启动代价。
+
+**Q: 改图会把我文生图的模型顶掉**
+默认 `edit_free_t2i = true`：启动改图 worker 前会先卸载文生图引擎，避免 32 GiB 卡上互相抢显存。
+两张卡或显存充裕可以设 `false` 让它们共存。
+
+**Q: 改图结果和原图差太多 / 完全没改**
+编辑 LoRA 对指令很敏感：要写清「改什么」+「保留什么」（例：`把背景换成晴天的海边，保留人物和姿势`）。
+CFG 太低会不听话，太高会过饱和；先试 `edit_guidance_scale = 4.0`、`edit_steps = 12-20`。
+
+**Q: 能用多张参考图吗**
+可以，`images` 按顺序传入（最多 `edit_max_ref_images`，默认 4），指令里要说明每张的用途。
+多张会显著变慢，参考图 KV 缓存只对同一组参考图有效。
+
+## 提示词 skill
+
+**Q: 日志说「未找到提示词 skill」**
+从 <https://github.com/Moeblack/moss-image-prompt-skill> 克隆到
+`~/.astrbot/data/skills/moss-image-prompt-skill/`，或在插件配置 `skill.path` 里填 SKILL.md 的路径。
+找不到时会按用户原文出图，不会报错。
+
+**Q: 为什么插件里没有内置的增强规则了**
+规则集是 CC BY-NC-ND 4.0，不能改写、不能打包进 MIT 项目，所以改成运行时读取。
+想换/改规则，直接改你自己那份 skill 文件即可（注意 ND 条款：不要发布改动版）。
+
+**Q: skill 太长会不会很贵**
+`skill.sections` 默认只取 0/1/2/3/10 章（约 1.5 万字符）。想更省就再减章节，或设 `skill.max_chars`。
+对话模型自己读文件那条路径不产生额外 token 成本，只在需要时按章节读。
 
 ## 其他
 

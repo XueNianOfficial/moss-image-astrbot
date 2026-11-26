@@ -10,9 +10,10 @@
       2. clones ai-toolkit at a pinned commit (it provides the inference engine)
       3. creates a virtualenv and installs CUDA torch + the dependencies
       4. downloads the MOSS-Image-SFT diffusers bundle from Hugging Face
-      5. writes config.toml with the resolved paths
-      6. copies the AstrBot plugin into AstrBot's data directory
-      7. optionally registers the server for auto-start at logon
+      5. installs the optional editing LoRA (Moss-Image-Edit) and prompt skill
+      6. writes config.toml with the resolved paths
+      7. copies the AstrBot plugin into AstrBot's data directory
+      8. optionally registers the server for auto-start at logon
 
     Re-running is safe: existing steps are skipped, config.toml is backed up.
 
@@ -28,12 +29,27 @@
 .PARAMETER PluginDir
     AstrBot plugin directory. Default: %USERPROFILE%\.astrbot\data\plugins
 
+.PARAMETER EditDir
+    Where to clone Moss-Image-Edit (GPL-3.0). Default: <repo>\.moss-image-edit
+
+.PARAMETER EditAdapterRepo
+    Hugging Face repo with the edit LoRA. Default: chinoll/Moss-Image-Edit
+
+.PARAMETER SkillDir
+    Where to clone moss-image-prompt-skill. Default: %USERPROFILE%\.astrbot\data\skills\moss-image-prompt-skill
+
 .PARAMETER Python
     Python 3.10-3.13 interpreter to build the venv with. Default: auto-detect
 
 .PARAMETER TorchIndex
     PyTorch wheel index. Default: https://download.pytorch.org/whl/cu128
     Use -Cpu to install CPU-only torch instead (very slow, for smoke testing).
+
+.PARAMETER SkipEdit
+    Do not install the editing pipeline (no 300 MB LoRA, no GPL dependency).
+
+.PARAMETER SkipSkill
+    Do not clone the prompt skill; the plugin falls back to the raw prompt.
 
 .PARAMETER SkipModel
     Do not download the model bundle (you already have one, see -ModelDir).
@@ -61,9 +77,14 @@ param(
     [string] $PluginDir,
     [string] $Python,
     [string] $TorchIndex = "https://download.pytorch.org/whl/cu128",
+    [string] $EditDir,
+    [string] $EditAdapterRepo = "chinoll/Moss-Image-Edit",
+    [string] $SkillDir,
     [switch] $SkipModel,
     [switch] $SkipPlugin,
     [switch] $SkipDeps,
+    [switch] $SkipEdit,
+    [switch] $SkipSkill,
     [switch] $Autostart,
     [switch] $Cpu
 )
@@ -78,8 +99,12 @@ $AiToolkitCommit = "04733873cf1da8060fce01316ec45daedbd4a918"
 $Root = $PSScriptRoot
 if (-not $AiToolkitDir) { $AiToolkitDir = Join-Path $Root ".ai-toolkit" }
 if (-not $ModelDir) { $ModelDir = Join-Path $Root ".models\MOSS-Image-SFT" }
+if (-not $EditDir) { $EditDir = Join-Path $Root ".moss-image-edit" }
+$EditAdapterDir = Join-Path $Root ".moss-image-edit-adapter"
+if (-not $SkillDir) { $SkillDir = Join-Path $env:USERPROFILE ".astrbot\data\skills\moss-image-prompt-skill" }
 $AiToolkitDir = [System.IO.Path]::GetFullPath($AiToolkitDir)
 $ModelDir = [System.IO.Path]::GetFullPath($ModelDir)
+$EditDir = [System.IO.Path]::GetFullPath($EditDir)
 
 function Write-Step([int] $n, [int] $total, [string] $message) {
     Write-Host ""
@@ -204,8 +229,8 @@ if ($SkipDeps) {
     & $VenvPython -m pip install huggingface_hub --quiet
 }
 
-# ----------------------------------------------------------------- 4. model
-Write-Step 4 7 "Preparing the model bundle"
+# ----------------------------------------------------- 4. model
+Write-Step 4 8 "Preparing the model bundle"
 if ($SkipModel) {
     if (-not (Test-Path (Join-Path $ModelDir "model_index.json"))) {
         Write-Warn "-SkipModel given but $ModelDir has no model_index.json"
@@ -225,8 +250,53 @@ if ($SkipModel) {
     }
 }
 
-# ---------------------------------------------------------------- 5. config
-Write-Step 5 7 "Writing config.toml"
+# ----------------------------------------------- 5. editing + prompt skill
+Write-Step 5 8 "Installing the optional editing LoRA and prompt skill"
+
+$editReady = $false
+if ($SkipEdit) {
+    Write-Warn "editing skipped (-SkipEdit)"
+} else {
+    if (Test-Path (Join-Path $EditDir "moss_edit\model.py")) {
+        Write-Ok "Moss-Image-Edit present: $EditDir"
+    } else {
+        Write-Ok "cloning Moss-Image-Edit (GPL-3.0, used as an external dependency)"
+        & git clone --depth 1 https://github.com/Chenkin-x/Moss-Image-Edit.git $EditDir
+        if ($LASTEXITCODE -ne 0) { Write-Warn "clone failed; editing will stay disabled" }
+    }
+    if (Test-Path (Join-Path $EditDir "moss_edit\model.py")) {
+        if (-not (Test-Path (Join-Path $EditAdapterDir "adapter_config.json"))) {
+            Write-Ok "downloading the edit LoRA from $EditAdapterRepo (~300 MB)"
+            $code = "from huggingface_hub import snapshot_download; snapshot_download('$EditAdapterRepo', local_dir=r'$EditAdapterDir')"
+            & $VenvPython -c $code
+            if ($LASTEXITCODE -ne 0) { Write-Warn "adapter download failed; editing will stay disabled" }
+        } else {
+            Write-Ok "edit LoRA present: $EditAdapterDir"
+        }
+        $editReady = Test-Path (Join-Path $EditAdapterDir "adapter_config.json")
+    }
+}
+if ($editReady) { Write-Ok "editing enabled" } else { Write-Warn "editing will be unavailable until edit_repo/edit_adapter are set" }
+
+if ($SkipSkill) {
+    Write-Warn "prompt skill skipped (-SkipSkill)"
+} else {
+    if (Test-Path (Join-Path $SkillDir "SKILL.md")) {
+        Write-Ok "prompt skill present: $SkillDir"
+    } else {
+        Write-Ok "cloning moss-image-prompt-skill (CC BY-NC-ND 4.0, read at runtime)"
+        New-Item -ItemType Directory -Force -Path (Split-Path $SkillDir -Parent) | Out-Null
+        & git clone --depth 1 https://github.com/Moeblack/moss-image-prompt-skill.git $SkillDir
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "clone failed; the plugin will fall back to the raw user prompt"
+        } else {
+            Write-Ok "prompt skill: $SkillDir"
+        }
+    }
+}
+
+# ---------------------------------------------------------------- 6. config
+Write-Step 6 8 "Writing config.toml"
 $configPath = Join-Path $Root "config.toml"
 if (Test-Path $configPath) {
     $backup = "$configPath.bak-" + (Get-Date -Format "yyyyMMdd-HHmmss")
@@ -237,18 +307,25 @@ $template = Get-Content (Join-Path $Root "config.example.toml") -Raw
 $template = $template.Replace('aitk_root = "G:/ai-toolkit"', ('aitk_root = "' + ($AiToolkitDir -replace '\\','/') + '"'))
 $template = $template.Replace('model_dir = "G:/model"', ('model_dir = "' + ($ModelDir -replace '\\','/') + '"'))
 $template = $template.Replace('output_dir = "./outputs"', ('output_dir = "' + ((Join-Path $Root "outputs") -replace '\\','/') + '"'))
+if ($editReady) {
+    $template = $template.Replace('edit_repo = ""', ('edit_repo = "' + ($EditDir -replace '\\','/') + '"'))
+    $template = $template.Replace('edit_adapter = ""', ('edit_adapter = "' + ($EditAdapterDir -replace '\\','/') + '"'))
+}
 Set-Content -Path $configPath -Value $template -Encoding UTF8
 Write-Ok "config: $configPath"
 
 $manifest = @{
-    ai_toolkit = $AiToolkitDir
-    model_dir  = $ModelDir
-    installed  = (Get-Date).ToString("s")
+    ai_toolkit  = $AiToolkitDir
+    model_dir   = $ModelDir
+    edit_repo   = if ($editReady) { $EditDir } else { "" }
+    edit_adapter = if ($editReady) { $EditAdapterDir } else { "" }
+    skill_dir   = $SkillDir
+    installed   = (Get-Date).ToString("s")
 } | ConvertTo-Json
 Set-Content -Path (Join-Path $Root ".install.json") -Value $manifest -Encoding UTF8
 
-# ---------------------------------------------------------------- 6. plugin
-Write-Step 6 7 "Installing the AstrBot plugin"
+# ---------------------------------------------------------------- 7. plugin
+Write-Step 7 8 "Installing the AstrBot plugin"
 if ($SkipPlugin) {
     Write-Warn "skipped (-SkipPlugin)"
 } else {
@@ -265,8 +342,8 @@ if ($SkipPlugin) {
     }
 }
 
-# ------------------------------------------------------------- 7. autostart
-Write-Step 7 7 "Auto-start"
+# ------------------------------------------------------------- 8. autostart
+Write-Step 8 8 "Auto-start"
 if ($Autostart) {
     & (Join-Path $Root "install-autostart.ps1")
     Write-Ok "registered"

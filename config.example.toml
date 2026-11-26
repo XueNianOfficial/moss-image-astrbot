@@ -68,6 +68,27 @@ lora_mode = "hook"
 # Scanned by GET /v1/loras.
 lora_dirs = []
 
+# --- reference editing (Moss-Image-Edit) ----------------------------------
+# Editing ("改图") is a separate pipeline: it needs the edit LoRA and a checkout
+# of https://github.com/Chenkin-x/Moss-Image-Edit, which is GPL-3.0 and is used
+# as an external runtime dependency (never vendored into this MIT project).
+# Leave the two paths empty (or set edit_enabled = false) to disable it.
+edit_enabled = true
+edit_repo = ""
+edit_adapter = ""
+# Interpreter for the edit worker; empty = the interpreter running the server.
+edit_python = ""
+edit_steps = 20
+edit_guidance_scale = 4.0
+edit_shift = 5.0
+edit_max_ref_images = 4
+edit_max_edge = 1024
+# Stop the edit worker (and free its VRAM) after this many idle seconds.
+edit_idle_unload_seconds = 600
+# Unload the text-to-image engine before the edit worker takes the card.
+edit_free_t2i = true
+edit_timeout = 900.0
+
 # --- HTTP -----------------------------------------------------------------
 api_key = ""
 output_dir = "./outputs"

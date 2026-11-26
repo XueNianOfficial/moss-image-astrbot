@@ -1,7 +1,7 @@
 """Checks for the AstrBot plugin helpers (no AstrBot runtime required).
 
 The plugin lives in AstrBot's data directory; the pure-python helpers
-(``prompt_parser``, ``prompt_enhancer.clean_caption``, ``layout_enhancer``)
+(``prompt_parser``, ``prompt_skill.clean_caption``, ``layout_enhancer``)
 are imported from there directly.
 """
 from __future__ import annotations
@@ -19,7 +19,7 @@ if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
 
 from astrbot_plugin_moss_image.layout_enhancer import extract_json  # noqa: E402
-from astrbot_plugin_moss_image.prompt_enhancer import clean_caption  # noqa: E402
+from astrbot_plugin_moss_image.prompt_skill import clean_caption  # noqa: E402
 from astrbot_plugin_moss_image.prompt_parser import parse_draw_request, size_from_ratio  # noqa: E402
 
 

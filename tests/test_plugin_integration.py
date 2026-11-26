@@ -43,10 +43,14 @@ from astrbot_plugin_moss_image.prompt_parser import parse_draw_request  # noqa: 
 
 
 class FakeEvent:
-    def __init__(self) -> None:
+    def __init__(self, messages: list | None = None) -> None:
         self.unified_msg_origin = "test:FriendMessage:42"
         self.message_str = ""
         self.sent: list = []
+        self._messages = list(messages or [])
+
+    def get_messages(self):
+        return self._messages
 
     def get_sender_id(self) -> str:
         return "42"
@@ -107,8 +111,17 @@ LAYOUT_DRAFT = {
 }
 
 
-def build_plugin(provider: FakeProvider) -> MossImagePlugin:
-    plugin = MossImagePlugin(context=FakeContext(provider), config={})
+LORA_CATALOG = (
+    "kemono | G:/tmp/kemono.safetensors | on | 0.7 | 兽人/Kemono 画风：柔和赛璐璐上色、蓬松毛发 | \n"
+    "xuenian | G:/tmp/xuenian.safetensors | off | 1.0 | 角色 LoRA「雪年」：白色毛发、红眼 | 雪年, xuenian"
+)
+
+
+def build_plugin(provider: FakeProvider, extra_config: dict | None = None) -> MossImagePlugin:
+    config = {"lora": {"catalog_lines": LORA_CATALOG}}
+    for section, values in (extra_config or {}).items():
+        config.setdefault(section, {}).update(values)
+    plugin = MossImagePlugin(context=FakeContext(provider), config=config)
     plugin.settings.base_url = SERVER
     plugin.settings.width, plugin.settings.height = 512, 512
     plugin.settings.steps = 4
@@ -247,8 +260,61 @@ async def run() -> int:
     assert tuned_outcome.images, "no image returned with sampler overrides"
     print(f"  sampler live   : shift=4.0 skip=off -> {len(tuned_outcome.images)} image(s)")
 
+    # 11. Prompt skill: guidance injection + skill-driven rewrite.
+    skill_path = os.environ.get("MOSS_TEST_SKILL")
+    plugin = build_plugin(FakeProvider(CAPTION))
+    if skill_path:
+        from astrbot_plugin_moss_image.prompt_skill import PromptSkill
+
+        plugin.skill = PromptSkill(skill_path)
+        plugin.prompter.skill = plugin.skill
+    info = plugin.skill.info()
+    if info.available:
+        request_obj = types.SimpleNamespace(system_prompt="", func_tool=types.SimpleNamespace(names=lambda: ["moss_draw_image"]))
+        await plugin._inject_tool_guidance(event, request_obj)
+        assert "提示词规范" in request_obj.system_prompt, request_obj.system_prompt[:200]
+        print(f"  skill guidance : injected ({info.name} v{info.version})")
+    else:
+        print("  skill guidance : skipped (no skill file on this machine)")
+
+    # 12. The edit command needs an image; a base64 image round-trips through
+    #     AstrBot's component API, which is what /edit relies on.
+    from astrbot.api.message_components import Image as BotImage
+
+    plugin = build_plugin(FakeProvider(CAPTION))
+    plugin.settings.cooldown = 0
+    sample = _sample_image_bytes()
+    image_event = FakeEvent([BotImage.fromBytes(sample)])
+    collected, warnings = await plugin._collect_images(image_event, 4)
+    assert len(collected) == 1 and collected[0][:8] == sample[:8], (len(collected), warnings)
+    print(f"  image collect  : {len(collected)} image(s), {len(collected[0])} bytes")
+
+    if os.environ.get("MOSS_TEST_EDIT") == "1":
+        request = parse_draw_request("把背景换成晴天的海边，保留角色 --size 768x768 --steps 8 --seed 5")
+        outcome = await plugin._render_edit(image_event, request, collected, [])
+        assert outcome, "no components returned"
+        assert any(getattr(item, "file", "").startswith("base64://") for item in outcome), "no edited image"
+        print(f"  edit live      : {len(outcome)} components")
+    else:
+        print("  edit live      : skipped (set MOSS_TEST_EDIT=1 to run a real edit)")
+
     print("plugin integration: all checks passed")
     return 0
+
+
+def _sample_image_bytes() -> bytes:
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (768, 768), (24, 32, 48))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((200, 160, 560, 520), fill=(210, 210, 220))
+    draw.ellipse((300, 300, 340, 340), fill=(200, 40, 60))
+    draw.ellipse((420, 300, 460, 340), fill=(200, 40, 60))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 if __name__ == "__main__":

@@ -45,6 +45,8 @@ class DrawRequest:
     loras: dict[str, float] = field(default_factory=dict)
     #: "auto" (decide by content), "caption" (plain caption), "layout", "raw"
     mode: str = "auto"
+    #: Skill dimension mode: "auto", "real", "anime" or "cross".
+    skill_mode: str = "auto"
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -204,5 +206,18 @@ def parse_draw_request(raw: str) -> DrawRequest:
         request.mode = "caption"
     elif "raw" in flags or "原样" in flags:
         request.mode = "raw"
+
+    skill_mode = str(flags.get("mode") or flags.get("风格") or "").strip().lower()
+    if skill_mode:
+        aliases = {
+            "real": "real", "realistic": "real", "photo": "real", "写实": "real", "真人": "real",
+            "anime": "anime", "2d": "anime", "二次元": "anime", "插画": "anime",
+            "cross": "cross", "跨次元": "cross", "mixed": "cross",
+            "auto": "auto",
+        }
+        if skill_mode in aliases:
+            request.skill_mode = aliases[skill_mode]
+        else:
+            request.warnings.append(f"未知的风格模式：{skill_mode}（可用 real/anime/cross/auto）")
 
     return request

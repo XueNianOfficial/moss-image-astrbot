@@ -1,12 +1,18 @@
-# MOSS-Image 绘图插件
+# MOSS-Image 绘图 / 改图插件
 
-让 AstrBot 调用本机 **MOSS-Image**（由 ai-toolkit 推理引擎驱动：int8 convrot8 量化 + 层卸载，LoRA 以 hook 动态挂载、不合并权重）出图，带
-**Prompt Enhancer** 与 **Layout Enhancer**，并注册 LLM 工具让 bot 能自主画图。
+让 AstrBot 调用本机 **MOSS-Image**（ai-toolkit 引擎：int8 convrot8 量化 + 层卸载，LoRA 以 hook
+动态挂载、不合并权重）出图，并用 **Moss-Image-Edit** 按指令改图。
+
+提示词规则**不在插件里**：它们来自独立的
+[moss-image-prompt-skill](https://github.com/Moeblack/moss-image-prompt-skill)（CC BY-NC-ND 4.0），
+插件在运行时从磁盘读取，不内置、不打包。布局增强仍走官方 `compile_prompt`。
 
 ## 依赖
 
 - 本机 MOSS-Image 服务（本仓库的服务端），默认监听 `http://127.0.0.1:8000`
   （装过开机自启会自动拉起；手动启动服务端目录下的 `run.ps1` / `run.bat`）
+- 改图需要服务端配好 `edit_repo` / `edit_adapter`
+- 提示词 skill 放在 `~/.astrbot/data/skills/moss-image-prompt-skill/SKILL.md`
 - 无额外 Python 依赖（仅用 AstrBot 自带的 aiohttp）
 
 ## 命令
@@ -14,11 +20,12 @@
 | 命令 | 说明 |
 | --- | --- |
 | `/draw <描述>` | 出图，别名 `/绘图` `/画图` `/画画` `/moss` `/生图` |
+| `/edit <指令>` | 改图（图与指令同发，或引用图片），别名 `/改图` `/编辑图片` `/修图` |
 | `/drawhelp` | 用法说明 |
-| `/drawstatus` | 服务状态、已加载模型、显存、空闲倒计时 |
+| `/drawstatus` | 服务状态、模型、显存、skill 与改图 worker |
 | `/loras` | 查看 LoRA 目录（名称/权重/描述/启用状态） |
 | `/drawunload` | 立即卸载模型释放显存 |
-| `/enhance <描述>` | 只预览增强后的提示词，不画图 |
+| `/enhance <描述>` | 只预览 skill 写出的提示词，不画图 |
 | `/layout <描述>` | 只预览编译好的 Layout 提示词，不画图 |
 
 ### `/draw` 参数
@@ -37,9 +44,35 @@
 | `--n N` | 一次出几张（默认上限 2） |
 | `--no <文本>` | 负面提示词 |
 | `--lora 名称:权重` | 指定 LoRA（名称来自配置里的 LoRA 目录），多个用逗号 |
-| `--enhance` | 强制增强提示词 |
+| `--enhance` | 用 skill 现场改写提示词（默认不改写，交给对话模型读 skill） |
+| `--mode real\|anime\|cross` | 指定写实 / 二次元 / 跨次元模式 |
 | `--raw` | 完全按原文出图 |
 | `--layout` | 走 Layout Enhancer |
+
+### `/edit` 参数
+
+```
+（发一张图）/edit 把背景换成晴天的海边，保留人物 --steps 12 --seed 7 --no low quality
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `--size WxH` | 输出尺寸；省略则按第一张参考图比例自动决定 |
+| `--steps N` | 采样步数（默认用服务端 `edit_steps`） |
+| `--seed N` | 复现同一次改图 |
+| `--no <文本>` | 负面提示词 |
+| `--enhance` | 先用 skill 把编辑指令写细（默认原样发送，编辑指令更看重保真） |
+
+最多同时给 `edit.max_images`（默认 4）张参考图，指令里要说明每张的用途。
+
+## LLM 工具
+
+| 工具 | 说明 |
+| --- | --- |
+| `moss_draw_image` | 出图；可带 `lora` 参数按 LoRA 描述自选 |
+| `moss_edit_image` | 改图；自动取当前消息或引用消息里的图片 |
+
+`skill.guidance` 开启时，系统提示会要求模型出图前先读 SKILL.md（按章节读，不要整篇灌入）。
 
 ## LoRA 目录
 
@@ -95,17 +128,19 @@ mychar | G:/loras/mychar.safetensors | off | 1.0 | 角色 LoRA「某角色」：
 后三项通过请求体传给服务端，服务端直接改 ai-toolkit holder 上的
 `sample_shift` / `uncond_skip_layers`，**不重新加载模型**。
 
-## Prompt Enhancer
+## 提示词 skill
 
-短于 `enhance.auto_enhance_below`（默认 60 字符）的描述会自动扩写。规则取自
-官方 `moss-image-prompt-enhancer` skill：
+插件不再内置提示词规则。规则来自
+[moss-image-prompt-skill](https://github.com/Moeblack/moss-image-prompt-skill)（CC BY-NC-ND 4.0），
+运行时读取，两种用法：
 
-- 只描述可见内容：主体与动作、外观、场景、镜头、材质、光线、色调、氛围
-- 保留用户的主体、数量、关系、风格与需要出现在图里的文字（原文照抄）
-- 不堆 "masterpiece, best quality" 之类的质量词，不写流程说明
-- 默认英文散文体，60–140 词
+1. **对话模型自己读**（默认）：`skill.guidance` 注入「出图前先读 SKILL.md、按章节取用」，
+   模型用自己的文件工具读，再带 prompt 调工具；
+2. **插件代读**（`--enhance` 或 `enhance.enabled = true`）：取 `skill.sections` 指定章节
+   （默认 `0,1,2,3,10`，约 1.5 万字符）作为 system prompt，让 LLM 输出
+   `{"positive","negative","params"}`，插件再按 `params` 的 steps / CFG / 尺寸补默认值。
 
-LLM 不可用或超时会**自动回退到原文**，不会因为增强失败而画不出图。
+找不到 skill 文件时按用户原文出图，不会报错；`/enhance` 会提示去哪里获取。
 
 ## Layout Enhancer
 
@@ -119,25 +154,13 @@ LLM 不可用或超时会**自动回退到原文**，不会因为增强失败而
 
 画布尺寸以命令/配置为准，`compile_prompt` 会拒绝超出画布的框。
 
-## LLM 工具
-
-注册了 `moss_draw_image(prompt, size, steps, seed, negative_prompt, enhance, layout, lora)`。
-启用了工具调用的模型在用户说「画一张…」「出图」「来一张」时会直接调用它，
-图片作为副作用发送，函数只返回一句状态，避免模型重复描述画面。
-
-`lora` 参数（如 `xuenian:0.9,kemono:0.5`）配合注入的目录摘要，让模型自主决定
-「这次要不要挂 LoRA、挂哪条、多重」；不匹配时留空即可。
-
-配置里 `behaviour.inject_tool_guidance` 会在系统提示中补一句「你可以直接画图」，
-对付一些人设里「不要调用工具 / 直接回答」的设定。
-
 ## 结构
 
 ```
 astrbot_plugin_moss_image/
-├── main.py             # 命令、LLM 工具、结果组装
-├── moss_client.py      # 与本机服务的 HTTP 客户端
-├── prompt_enhancer.py  # Prompt Enhancer
+├── main.py             # 命令、两个 LLM 工具、结果组装
+├── moss_client.py      # 与本机服务的 HTTP 客户端（生成 / 改图）
+├── prompt_skill.py     # 提示词 skill 加载（不内置规则）
 ├── layout_enhancer.py  # Layout Enhancer（LLM draft + 校验重试）
 ├── prompt_parser.py    # --flag 解析、尺寸换算
 ├── compile_prompt.py   # 官方 Layout 编译器（原样内置）
@@ -147,15 +170,19 @@ astrbot_plugin_moss_image/
 ## 常见问题
 
 **「无法连接 MOSS-Image 服务」**
-服务没起来。运行 `G:\MOSS-Image-Server\run.ps1`，或用计划任务 `MOSS-Image Server` 启动；
-`/drawstatus` 可以看到连接状态。
+服务没起来。运行服务端目录下的 `run.ps1`（或装好的开机自启）；`/drawstatus` 可看连接状态。
 
-**第一次出图特别慢**
-服务是懒加载的：第一个请求会先加载模型（约 30 秒），空闲 10 分钟后自动卸载，
-下一个请求再加载。想常驻可以调大服务端 `--idle-unload`。
+**第一次出图 / 改图特别慢**
+服务是懒加载的：第一个请求先加载模型（约 20 秒）。改图 worker 冷启动约 18 秒，
+之后热请求 1024²/12 步约 37 秒；空闲 10 分钟自动退出并释放显存。
 
-**出图很慢 / 显存紧张**
-训练任务在占用显卡时，文本编码器会留在内存，单次编码约 10 秒。等显卡空闲后重启服务会更块。
+**改图报「改图功能不可用」**
+服务端没配 `edit_repo` / `edit_adapter`。`/drawstatus` 会显示原因，
+或 `GET /v1/edit/status` 看 `reason`。
+
+**`/edit` 说没找到图片**
+图片要和指令一起发，或引用（回复）一张带图的消息；部分适配器的引用只带 id，
+插件会尝试 `get_msg` 取回，仍失败就请直接把图片和指令放在同一条消息里。
 
 **Layout 总是失败**
 换个更明确的描述，或把 `layout.max_retries` 调大。Layout 对文字框尺寸敏感，

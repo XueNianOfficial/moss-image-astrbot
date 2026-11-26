@@ -1,21 +1,26 @@
-"""AstrBot plugin: MOSS-Image drawing through the local ai-toolkit engine.
+"""AstrBot plugin: MOSS-Image drawing and reference editing via a local server.
 
 Commands
 --------
 ``/draw`` (``/绘图`` ``/画图`` ``/画画`` ``/moss``)
     Draw an image. Supports ``--size``/``--ar``/``--steps``/``--seed``/``--no``/
     ``--lora``/``--enhance``/``--raw``/``--layout``.
+``/edit`` (``/改图`` ``/编辑图片``)
+    Edit the image in the message (or the quoted one) with an instruction.
 ``/drawhelp``     usage guide
-``/drawstatus``   server state, loaded model, VRAM, idle countdown
+``/drawstatus``   server state, loaded model, VRAM, skill and edit worker
 ``/drawunload``   release the model immediately
-``/enhance``      preview the enhanced caption without drawing
+``/loras``        list the configured LoRA catalog
+``/enhance``      preview the skill-written prompt without drawing
 ``/layout``       preview the compiled Layout prompt without drawing
 
-An LLM tool (``moss_draw_image``) is registered so the bot can decide to draw
-on its own during a conversation.
+Prompt writing is delegated to the ``moss-image-prompt-skill`` skill (loaded
+from disk, never vendored).  LLM tools ``moss_draw_image`` and
+``moss_edit_image`` are registered so the bot can draw or edit on its own.
 """
 from __future__ import annotations
 
+import base64
 import re
 import time
 from dataclasses import dataclass
@@ -28,6 +33,7 @@ from astrbot.api.star import Context, Star
 from .layout_enhancer import LayoutEnhancer, LayoutError
 from .lora_config import DEFAULT_CATALOG, LoRACatalog, parse_catalog
 from .moss_client import (
+    EditOutcome,
     GenerationOutcome,
     MossClient,
     MossConnectionError,
@@ -35,12 +41,13 @@ from .moss_client import (
     MossServerError,
     MossTimeoutError,
 )
-from .prompt_enhancer import PromptEnhancer
-from .prompt_parser import DrawRequest, parse_draw_request
+from .prompt_parser import DrawRequest, parse_draw_request, parse_size
+from .prompt_skill import PromptSkill, SkillPrompter, clean_caption
 
 TOOL_NAME = "moss_draw_image"
+EDIT_TOOL_NAME = "moss_edit_image"
 #: Bumped when the handler contract changes; shows up in the load log.
-PLUGIN_BUILD = "2-chain-result"
+PLUGIN_BUILD = "3-edit-skill"
 
 _COMMAND_RE = re.compile(
     r"^[/!#]?\s*(draw|moss|绘图|画图|画画|生图)\b\s*[:：]?\s*", re.IGNORECASE
@@ -66,9 +73,18 @@ class Settings:
     shift: float | None = None
     uncond_skip_layers: tuple[int, ...] | None = None
     max_images: int = 2
-    enhance_enabled: bool = True
+    # Prompt writing lives in the external skill, not in this plugin.
+    enhance_enabled: bool = False
     auto_enhance_below: int = 60
     max_prompt_chars: int = 1400
+    skill_enabled: bool = True
+    skill_path: str = ""
+    skill_sections: str = "0,1,2,3,10"
+    skill_max_chars: int = 0
+    skill_guidance: bool = True
+    skill_timeout: float = 150.0
+    edit_enabled: bool = True
+    edit_max_images: int = 4
     layout_enabled: bool = True
     layout_retries: int = 2
     lora_enabled: bool = True
@@ -120,6 +136,8 @@ def parse_settings(config) -> Settings:
     server = _section(config, "server")
     generation = _section(config, "generation")
     enhance = _section(config, "enhance")
+    skill = _section(config, "skill")
+    edit = _section(config, "edit")
     layout = _section(config, "layout")
     lora = _section(config, "lora")
     behaviour = _section(config, "behaviour")
@@ -139,6 +157,14 @@ def parse_settings(config) -> Settings:
     settings.enhance_enabled = _bool(enhance, "enabled", settings.enhance_enabled)
     settings.auto_enhance_below = int(enhance.get("auto_enhance_below") or settings.auto_enhance_below)
     settings.max_prompt_chars = int(enhance.get("max_prompt_chars") or settings.max_prompt_chars)
+    settings.skill_enabled = _bool(skill, "enabled", settings.skill_enabled)
+    settings.skill_path = str(skill.get("path") or "").strip()
+    settings.skill_sections = str(skill.get("sections") or settings.skill_sections).strip()
+    settings.skill_max_chars = max(0, int(skill.get("max_chars") or 0))
+    settings.skill_guidance = _bool(skill, "guidance", settings.skill_guidance)
+    settings.skill_timeout = max(30.0, float(skill.get("timeout") or settings.skill_timeout))
+    settings.edit_enabled = _bool(edit, "enabled", settings.edit_enabled)
+    settings.edit_max_images = max(1, min(8, int(edit.get("max_images") or settings.edit_max_images)))
     settings.layout_enabled = _bool(layout, "enabled", settings.layout_enabled)
     settings.layout_retries = int(layout.get("max_retries") or settings.layout_retries)
     settings.lora_enabled = _bool(lora, "enabled", settings.lora_enabled)
@@ -167,10 +193,16 @@ class MossImagePlugin(Star):
             api_key=self.settings.api_key,
             generation_timeout=self.settings.timeout,
         )
-        self.enhancer = PromptEnhancer(
+        self.skill = PromptSkill(
+            self.settings.skill_path if self.settings.skill_enabled else "",
+            sections=self.settings.skill_sections,
+            max_chars=self.settings.skill_max_chars,
+        )
+        self.prompter = SkillPrompter(
             context,
-            enabled=self.settings.enhance_enabled,
-            max_chars=self.settings.max_prompt_chars,
+            self.skill,
+            enabled=self.settings.skill_enabled,
+            timeout=self.settings.skill_timeout,
         )
         self.layout = LayoutEnhancer(
             context,
@@ -199,8 +231,20 @@ class MossImagePlugin(Star):
         try:
             health = await self.client.health()
             logger.info(f"[moss_image] 服务状态: {health.get('status')}")
+            logger.info(f"[moss_image] 改图可用: {health.get('edit_available')}")
         except MossError as error:
             logger.warning(f"[moss_image] 暂时无法连接绘图服务: {error.user_message()}")
+        info = self.skill.info()
+        if info.available:
+            logger.info(
+                f"[moss_image] 提示词 skill: {info.name} v{info.version} ({info.license}) "
+                f"{info.chars} 字符 -> {info.path}"
+            )
+        elif self.settings.skill_enabled:
+            logger.warning(
+                "[moss_image] 未找到提示词 skill（moss-image-prompt-skill），"
+                "只会按用户原文出图；把 SKILL.md 放到 AstrBot 的 skills 目录或在配置里填写路径"
+            )
         await self._register_catalog()
 
     async def _register_catalog(self) -> None:
@@ -327,6 +371,21 @@ class MossImagePlugin(Star):
         stats = status.get("stats") or {}
         if stats.get("requests"):
             lines.append(f"📈 已生成 {stats.get('images', 0)} 张 / {stats.get('requests', 0)} 次请求")
+        skill = self.skill.info()
+        if skill.available:
+            lines.append(f"📚 提示词 skill：{skill.name} v{skill.version or '?'}（{self.settings.skill_sections or '全文'}）")
+        elif self.settings.skill_enabled:
+            lines.append("📚 提示词 skill：未找到（按原文出图）")
+        edit = status.get("edit") or {}
+        if edit:
+            edit_state = {"ready": "✅ 已加载", "loading": "⏳ 加载中", "idle": "💤 空闲"}.get(
+                str(edit.get("state")), str(edit.get("state"))
+            )
+            if edit.get("available"):
+                extra = f"｜空闲 {float(edit.get('idle_seconds') or 0):.0f}s"
+                lines.append(f"🖌️ 改图：{edit_state}{extra}")
+            else:
+                lines.append(f"🖌️ 改图：未配置（{edit.get('reason')}）")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("drawunload", alias={"卸载模型", "释放显存"})
@@ -353,14 +412,25 @@ class MossImagePlugin(Star):
             return
         raw = self._strip_command(event.message_str)
         if not raw.strip():
+            yield event.plain_result("用法：/enhance 一只猫在窗台上 [--mode real|anime|cross]")
+            return
+        request = parse_draw_request(raw.strip())
+        if not request.text:
             yield event.plain_result("用法：/enhance 一只猫在窗台上")
             return
-        enhancement = await self.enhancer.enhance(raw.strip(), umo=event.unified_msg_origin)
-        lines = ["✨ 增强后的提示词", enhancement.text]
-        if enhancement.warning:
-            lines.append(f"⚠️ {enhancement.warning}")
-        if not enhancement.used_llm:
-            lines.append("（未使用 LLM，原样返回）")
+        rewrite = await self.prompter.rewrite(
+            request.text, umo=event.unified_msg_origin, mode=request.skill_mode
+        )
+        info = self.skill.info()
+        lines = [f"✨ 由 skill 生成的提示词（{info.name} v{info.version or '?'}）", rewrite.positive]
+        if rewrite.negative:
+            lines.append(f"\n🚫 负面提示词\n{rewrite.negative}")
+        if rewrite.params:
+            lines.append(f"\n⚙️ 建议参数\n{rewrite.params}")
+        if rewrite.warning:
+            lines.append(f"\n⚠️ {rewrite.warning}")
+        if not rewrite.used_llm:
+            lines.append("\n（未使用 LLM，原样返回）")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("layout", alias={"布局增强", "排版提示词"})
@@ -393,6 +463,51 @@ class MossImagePlugin(Star):
     # ------------------------------------------------------------------ #
     # LLM tool
     # ------------------------------------------------------------------ #
+    @filter.command("edit", alias={"改图", "编辑图片", "修图", "mossedit"})
+    async def edit_command(self, event: AstrMessageEvent):
+        """按文字指令修改图片（Moss-Image-Edit）。用法：发图 + /edit 把背景换成晴天海边"""
+        if not self.settings.edit_enabled:
+            yield event.plain_result("改图功能已在插件配置中关闭")
+            return
+        if not await self._permitted(event):
+            return
+        raw = self._strip_command(event.message_str)
+        images, image_warnings = await self._collect_images(event, self.settings.edit_max_images)
+        if not images:
+            yield event.plain_result(
+                "🖼️ 没找到要修改的图片：请把图片和 /edit 指令一起发送，"
+                "或引用（回复）一张图片后再发 /edit 指令"
+            )
+            return
+        request = parse_draw_request(raw.strip())
+        if not request.text:
+            yield event.plain_result(
+                "✏️ 请说明要怎么改\n例如：/edit 把背景换成晴天的海边，保留人物\n"
+                "可选：--size 1024x1024 --steps 12 --seed 7 --no low quality --enhance"
+            )
+            return
+        if not await self._check_cooldown(event):
+            return
+        if self.settings.send_progress:
+            yield event.plain_result(f"🖌️ 正在修改 {len(images)} 张参考图，请稍候…")
+
+        try:
+            components = await self._render_edit(event, request, images, image_warnings)
+        except MossTimeoutError as error:
+            yield event.plain_result(f"⏰ {error.user_message()}")
+            return
+        except MossConnectionError as error:
+            yield event.plain_result(self._connection_text(error))
+            return
+        except MossError as error:
+            yield event.plain_result(f"❌ 改图失败：{error.user_message()}")
+            return
+        except Exception as error:  # noqa: BLE001 - never break the event loop
+            logger.exception(f"[moss_image] 改图时发生未预期的错误: {error}")
+            yield event.plain_result(f"❌ 改图失败：{error}")
+            return
+        yield event.chain_result(components)
+
     @filter.llm_tool(name=TOOL_NAME)
     async def draw_tool(
         self,
@@ -468,6 +583,77 @@ class MossImagePlugin(Star):
             return f"图片已生成但发送失败：{error}"
         return "图片已生成并发送给用户，请用一句话简短回应，不要重复描述画面。"
 
+    @filter.llm_tool(name=EDIT_TOOL_NAME)
+    async def edit_tool(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        size: str = "",
+        steps: int = -1,
+        seed: int = -1,
+        negative_prompt: str = "",
+        enhance: bool = False,
+    ):
+        """按文字指令修改用户发来或引用（回复）的图片，并把结果直接发给用户。
+
+        使用场景（命中任意一条就应调用）：
+        - 用户发送/引用了一张图片，并要求改动它：「把背景换成…」「换成夏装」「变成夜景」
+        - 用户说「改一下」「修一下」「把这个换成…」「在这张图上加…」
+        - 用户想保留原图的人物/构图，只改变局部
+
+        参考图会自动从当前消息或引用消息里取，不需要你传图片。
+        每次改图要几十秒；成功后图片已发给用户，你只需一句话简短回应。
+
+        Args:
+            prompt(string): 编辑指令，写清「改什么」与「保留什么」，例如「把背景换成晴天的海边，保留人物和姿势」
+            size(string): 输出尺寸，如 1024x1024；留空则按参考图比例自动决定
+            steps(int): 采样步数，-1 使用服务端默认值（通常 12-20）
+            seed(int): 随机种子，-1 表示随机
+            negative_prompt(string): 额外排除的内容
+            enhance(bool): 是否先用提示词 skill 把指令改写成更精确的编辑指令
+        """
+        if not self.settings.edit_enabled:
+            return "改图功能已在插件配置中关闭。"
+        if not await self._permitted(event, quiet=True):
+            return "改图权限受限。"
+
+        images, warnings = await self._collect_images(event, self.settings.edit_max_images)
+        if not images:
+            return "没有找到可用的图片：请让用户把图片和指令一起发送，或引用一张图片后再试。"
+
+        request = parse_draw_request("")
+        request.text = self._normalise_prompt_argument(prompt) or ""
+        if not request.text:
+            return "缺少编辑指令。"
+        if size:
+            parsed = parse_draw_request(f"x --size {size}")
+            request.width, request.height = parsed.width, parsed.height
+        if steps and int(steps) > 0:
+            request.steps = min(200, int(steps))
+        if seed is not None and int(seed) >= 0:
+            request.seed = int(seed)
+        request.negative = (negative_prompt or "").strip()
+        request.mode = "caption" if enhance else "raw"
+
+        try:
+            components = await self._render_edit(event, request, images, warnings)
+        except MossTimeoutError as error:
+            return f"改图超时：{error.user_message()}"
+        except MossConnectionError as error:
+            return self._connection_text(error)
+        except MossError as error:
+            return f"改图失败：{error.user_message()}"
+        except Exception as error:  # noqa: BLE001
+            logger.exception(f"[moss_image] LLM 工具改图失败: {error}")
+            return f"改图失败：{error}"
+
+        try:
+            await event.send(MessageChain(components))
+        except Exception as error:  # noqa: BLE001
+            logger.error(f"[moss_image] 发送改图结果失败: {error}")
+            return f"图片已生成但发送失败：{error}"
+        return "改图完成并已发送给用户，请用一句话简短回应，不要重复描述画面。"
+
     @filter.on_llm_request()
     async def _inject_tool_guidance(self, event: AstrMessageEvent, request) -> None:
         """Remind personas that the drawing tool exists."""
@@ -482,13 +668,17 @@ class MossImagePlugin(Star):
                 names = names_method()
             except Exception:  # noqa: BLE001 - unknown tool-set implementation
                 names = None
-            if names is not None and TOOL_NAME not in names:
+            if names is not None and TOOL_NAME not in names and EDIT_TOOL_NAME not in names:
                 return
         guidance = (
-            "【绘图能力】你可以调用 moss_draw_image 工具直接生成图片。"
-            "当用户要求画图、出图、生成图片，或描述了一个希望看到的画面时，"
-            "请立即调用该工具，不要只用文字回应，也不要声称无法画图。"
+            "【绘图/改图能力】你可以调用 moss_draw_image 生成图片，"
+            "调用 moss_edit_image 按指令修改用户发来（或引用）的图片。"
+            "当用户要求画图、出图、生成图片、改图、换背景、换服装时，"
+            "请立即调用对应工具，不要只用文字回应，也不要声称无法画图。"
         )
+        skill_guide = self.skill.guide() if self.settings.skill_guidance else ""
+        if skill_guide:
+            guidance += "\n\n" + skill_guide
         if self.catalog.allow_bot_choice and self.catalog.entries:
             guidance += (
                 "\n\n【可用 LoRA】调用 moss_draw_image 时用 lora 参数选择，"
@@ -505,6 +695,130 @@ class MossImagePlugin(Star):
     # ------------------------------------------------------------------ #
     # rendering
     # ------------------------------------------------------------------ #
+    def _apply_skill_params(self, params, request, width, height, steps, guidance, warnings):
+        """Let the skill's recommended parameters fill in what the user left open."""
+        if not isinstance(params, dict):
+            return width, height, steps, guidance
+        if request.steps is None and params.get("steps") is not None:
+            try:
+                value = int(float(params["steps"]))
+                if 1 <= value <= 200:
+                    steps = value
+            except (TypeError, ValueError):
+                pass
+        if request.guidance is None and params.get("guidance_scale") is not None:
+            try:
+                value = float(params["guidance_scale"])
+                if 0 <= value <= 20:
+                    guidance = value
+            except (TypeError, ValueError):
+                pass
+        if request.width is None and request.height is None and isinstance(params.get("size"), str):
+            parsed = parse_size(params["size"])
+            if parsed:
+                width, height = parsed
+        if request.seed is None and params.get("seed") is not None:
+            try:
+                request.seed = int(params["seed"])
+            except (TypeError, ValueError):
+                pass
+        return width, height, steps, guidance
+
+    async def _collect_images(self, event: AstrMessageEvent, limit: int) -> tuple[list[bytes], list[str]]:
+        """Images from the current message, falling back to the quoted message."""
+        warnings: list[str] = []
+        components: list = []
+        for component in event.get_messages() or []:
+            if isinstance(component, Image) and (component.url or component.file or component.path):
+                components.append(component)
+        if not components:
+            reply = next(
+                (item for item in (event.get_messages() or []) if type(item).__name__ == "Reply"),
+                None,
+            )
+            try:
+                from astrbot.core.utils.quoted_message.extractor import extract_quoted_message_images
+
+                for reference in await extract_quoted_message_images(event, reply):
+                    components.append(Image(file=str(reference)))
+            except Exception as error:  # noqa: BLE001 - optional AstrBot internal helper
+                logger.debug(f"[moss_image] 引用图片解析失败: {error}")
+        images: list[bytes] = []
+        for component in components[: max(1, limit)]:
+            try:
+                encoded = await component.convert_to_base64()
+                images.append(base64.b64decode(encoded))
+            except Exception as error:  # noqa: BLE001 - report, keep the rest
+                warnings.append(f"读取图片失败（{type(error).__name__}）")
+        if len(components) > limit:
+            warnings.append(f"只取前 {limit} 张参考图")
+        return images, warnings
+
+    async def _render_edit(
+        self, event: AstrMessageEvent, request: DrawRequest, images: list[bytes], warnings: list[str]
+    ) -> list:
+        warnings = list(warnings) + list(request.warnings)
+        prompt = request.text
+        negative = ", ".join(part for part in (self.settings.negative_prompt, request.negative) if part)
+        if request.mode == "caption" and self.settings.skill_enabled:
+            rewrite = await self.prompter.rewrite(
+                prompt,
+                umo=event.unified_msg_origin,
+                mode=request.skill_mode,
+                hint="这是图像编辑指令：要明确写出改什么、保留什么，不要改写成一张全新的画面描述。",
+            )
+            if rewrite.used_llm:
+                prompt = rewrite.positive
+                negative = ", ".join(
+                    part for part in (self.settings.negative_prompt, rewrite.negative, request.negative) if part
+                )
+            if rewrite.warning:
+                warnings.append(rewrite.warning)
+
+        logger.info(
+            f"[moss_image] edit {len(images)} ref(s) steps={request.steps or 'auto'} "
+            f"prompt={prompt[:120]!r}"
+        )
+        outcome = await self.client.edit(
+            images,
+            prompt,
+            negative_prompt=negative,
+            width=request.width,
+            height=request.height,
+            steps=request.steps,
+            guidance=request.guidance,
+            seed=request.seed,
+            shift=self.settings.shift,
+            timeout=self.settings.timeout,
+        )
+        return self._build_edit_components(outcome, warnings)
+
+    def _build_edit_components(self, outcome: EditOutcome, warnings: list[str]) -> list:
+        components: list = [Plain("🖌️ 改图完成")]
+        image = Image.fromBytes(outcome.data)
+        try:
+            image.set_extra("group_id", f"moss_edit_{outcome.seed}")
+        except Exception:  # noqa: BLE001 - optional on some versions
+            pass
+        components.append(image)
+        if self.settings.send_parameters:
+            bits: list[str] = []
+            if outcome.width and outcome.height:
+                bits.append(f"{outcome.width}x{outcome.height}")
+            if outcome.steps:
+                bits.append(f"{outcome.steps} 步")
+            if outcome.references > 1:
+                bits.append(f"{outcome.references} 张参考图")
+            if outcome.seed is not None:
+                bits.append(f"seed {outcome.seed}")
+            if outcome.seconds:
+                bits.append(f"{outcome.seconds:.1f}s")
+            if bits:
+                components.append(Plain("\n" + "｜".join(bits)))
+        if warnings:
+            components.append(Plain("\n⚠️ " + "；".join(dict.fromkeys(warnings))))
+        return components
+
     async def _render(self, event: AstrMessageEvent, request: DrawRequest) -> list:
         width = request.width or self.settings.width
         height = request.height or self.settings.height
@@ -530,15 +844,20 @@ class MossImagePlugin(Star):
             and self.settings.enhance_enabled
             and len(request.text) < self.settings.auto_enhance_below
         )
-        if not used_layout and should_enhance and self.settings.enhance_enabled:
-            enhancement = await self.enhancer.enhance(
-                request.text, umo=event.unified_msg_origin
+        skill_negative = ""
+        if not used_layout and should_enhance and self.settings.skill_enabled:
+            rewrite = await self.prompter.rewrite(
+                request.text, umo=event.unified_msg_origin, mode=request.skill_mode
             )
-            if enhancement.used_llm:
-                prompt = enhancement.text
+            if rewrite.used_llm:
+                prompt = rewrite.positive
+                skill_negative = rewrite.negative
                 enhanced = True
-            if enhancement.warning:
-                warnings.append(enhancement.warning)
+                width, height, steps, guidance = self._apply_skill_params(
+                    rewrite.params, request, width, height, steps, guidance, warnings
+                )
+            if rewrite.warning:
+                warnings.append(rewrite.warning)
 
         logger.info(
             f"[moss_image] {width}x{height} steps={steps} layout={used_layout} "
@@ -553,7 +872,9 @@ class MossImagePlugin(Star):
         if triggers:
             prompt = f"{prompt}, {', '.join(triggers)}"
         lora_summary = "，".join(f"{name} {weight:g}" for name, weight in weights.items() if weight > 0)
-        negative = ", ".join(part for part in (self.settings.negative_prompt, request.negative) if part)
+        negative = ", ".join(
+            part for part in (self.settings.negative_prompt, skill_negative, request.negative) if part
+        )
 
         try:
             outcome = await self.client.generate(
@@ -704,13 +1025,25 @@ class MossImagePlugin(Star):
 
     def _help_text(self) -> str:
         s = self.settings
+        skill = self.skill.info()
+        skill_line = (
+            f"  （当前 skill：{skill.name} v{skill.version or '?'}）"
+            if skill.available
+            else "  （未找到 skill 文件，只会按原文出图）"
+        )
         return "\n".join(
             [
-                "🎨 MOSS-Image 绘图（ai-toolkit 引擎）",
+                "🎨 MOSS-Image 绘图 / 改图",
                 "",
                 "【基本用法】",
                 "/draw <画面描述>",
                 "例：/draw 雨夜的霓虹街道，一只白狐回头，电影感",
+                "",
+                "【改图】发图或引用图片后：",
+                "/edit <改动说明>",
+                "例：/edit 把背景换成晴天的海边，保留人物",
+                "  --steps 12 --seed 7 --no low quality",
+                "  最多可同时给 {n} 张参考图".format(n=s.edit_max_images),
                 "",
                 "【尺寸】",
                 "  --size 1024x1536   直接指定像素（16 的倍数）",
@@ -723,10 +1056,14 @@ class MossImagePlugin(Star):
                 f"  --n 2              一次出几张（最多 {s.max_images}）",
                 "  --no blurry, 水印  负面提示词",
                 "",
-                "【提示词增强】",
-                "  --enhance          强制把描述扩写成详细英文提示词",
+                "【提示词规范（独立 skill）】",
+                "  提示词由 moss-image-prompt-skill 编写，插件不再内置增强规则；",
+                "  对话时会让模型先读该 skill 再写提示词。",
+                skill_line,
+                "  --enhance          用 skill 现场改写成规范提示词",
+                "  --mode real|anime|cross  指定写实/二次元/跨次元",
                 "  --raw              完全按原文出图",
-                "  （描述较短时默认自动增强）",
+                "  /enhance <描述>    只预览 skill 写出的提示词",
                 "",
                 "【布局增强】",
                 "  --layout           生成带文字/元素定位的 Layout",
@@ -740,8 +1077,7 @@ class MossImagePlugin(Star):
                 "  （AI 会按 LoRA 描述自动决定是否使用及权重）",
                 "",
                 "【其他】",
-                "  /drawstatus   服务状态与显存",
+                "  /drawstatus   服务状态、显存、skill 与改图状态",
                 "  /drawunload   立即卸载模型释放显存",
-                "  /enhance <描述>  只预览增强后的提示词",
             ]
         )

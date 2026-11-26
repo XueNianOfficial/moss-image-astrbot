@@ -42,5 +42,9 @@ jobs:
           pip install -r requirements.txt
       - name: Server schema / config tests
         run: python tests/test_schemas.py
+      - name: Editing schema / lifecycle tests
+        run: python tests/test_edit.py
       - name: LoRA registry tests
         run: python tests/test_lora.py
+      - name: Prompt skill loader tests
+        run: python tests/test_prompt_skill.py

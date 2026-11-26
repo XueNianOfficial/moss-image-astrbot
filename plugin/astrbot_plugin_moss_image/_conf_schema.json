@@ -118,18 +118,18 @@
     }
   },
   "enhance": {
-    "description": "Prompt Enhancer（提示词增强）",
+    "description": "Prompt Enhancer（已改为独立 skill）",
     "type": "object",
-    "hint": "用当前对话的 LLM 把简短描述扩写成详细的英文画面描述，遵循 MOSS-Image 官方 prompt enhancer 规则。",
+    "hint": "插件不再内置提示词规则。默认按用户原文出图，由对话模型先读 moss-image-prompt-skill 再写提示词；这里只控制「自动改写」与长度上限。",
     "items": {
       "enabled": {
-        "description": "启用提示词增强",
+        "description": "自动改写短描述",
         "type": "bool",
-        "default": true,
-        "hint": "关闭后一律按用户原文出图（等同 --raw）"
+        "default": false,
+        "hint": "默认关闭：提示词交给 skill（对话模型自己读文件）。开启后短描述会自动走一次 skill 改写，代价是多一次 LLM 调用"
       },
       "auto_enhance_below": {
-        "description": "自动增强的字符阈值",
+        "description": "自动改写的字符阈值",
         "type": "int",
         "default": 60,
         "slider": {
@@ -137,10 +137,10 @@
           "max": 300,
           "step": 10
         },
-        "hint": "描述短于这个长度时自动增强；长描述默认原样使用。--enhance 始终增强，--raw 从不增强"
+        "hint": "仅在「自动改写短描述」开启时生效；--enhance 始终改写，--raw 从不改写"
       },
       "max_prompt_chars": {
-        "description": "增强结果最大字符数",
+        "description": "提示词最大字符数",
         "type": "int",
         "default": 1400,
         "slider": {
@@ -149,6 +149,84 @@
           "step": 100
         },
         "hint": "MOSS-Image 支持最长 4096 token 的提示词，一般 1000-1500 字符足够"
+      }
+    }
+  },
+  "skill": {
+    "description": "提示词 Skill（moss-image-prompt-skill）",
+    "type": "object",
+    "hint": "提示词规范来自 https://github.com/Moeblack/moss-image-prompt-skill（CC BY-NC-ND 4.0），运行时从磁盘读取，插件不内置、不打包其内容。",
+    "items": {
+      "enabled": {
+        "description": "启用 prompt skill",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后插件既不注入「先读 skill」提示，也不做任何改写"
+      },
+      "path": {
+        "description": "SKILL.md 路径",
+        "type": "string",
+        "default": "",
+        "hint": "留空则自动查找 <AstrBot数据目录>/skills/moss-image-prompt-skill/SKILL.md；也可以直接填文件或目录",
+        "obvious_hint": true
+      },
+      "sections": {
+        "description": "参与改写的章节",
+        "type": "string",
+        "default": "0,1,2,3,10",
+        "hint": "只把这些章节塞进 LLM 系统提示，控制成本；留空 = 整篇（约 6.6 万字符，较贵）。0=任务定义 1=tag清洗 2=角色 3=媒介光影 10=模板自检"
+      },
+      "max_chars": {
+        "description": "章节文本上限（字符）",
+        "type": "int",
+        "default": 0,
+        "slider": {
+          "min": 0,
+          "max": 40000,
+          "step": 1000
+        },
+        "hint": "0 = 不截断。默认章节约 1.5 万字符"
+      },
+      "guidance": {
+        "description": "注入「先读 skill」提示",
+        "type": "bool",
+        "default": true,
+        "hint": "在系统提示里要求模型出图前先读 SKILL.md（按章节读，不要整篇灌入）"
+      },
+      "timeout": {
+        "description": "改写超时（秒）",
+        "type": "int",
+        "default": 150,
+        "slider": {
+          "min": 30,
+          "max": 600,
+          "step": 10
+        },
+        "hint": "超时后自动回退用户原文，不会导致出图失败"
+      }
+    }
+  },
+  "edit": {
+    "description": "图像参考编辑（Moss-Image-Edit）",
+    "type": "object",
+    "hint": "让 bot 按文字指令修改图片（换背景/换装/换光线）。需要服务端配置好 edit_repo 与 edit_adapter。",
+    "items": {
+      "enabled": {
+        "description": "启用 /edit 与 moss_edit_image",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后这些入口会直接提示已关闭"
+      },
+      "max_images": {
+        "description": "最多参考图张数",
+        "type": "int",
+        "default": 4,
+        "slider": {
+          "min": 1,
+          "max": 8,
+          "step": 1
+        },
+        "hint": "多图编辑时按顺序传入，指令里要说明每张的用途"
       }
     }
   },

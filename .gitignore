@@ -11,9 +11,11 @@ config.toml.bak-*
 .install.json
 .install.sh.log
 
-# Model bundle / clones (both are downloaded by install.ps1 / install.sh)
+# Model bundle / clones (all downloaded by install.ps1 / install.sh)
 .models/
 .ai-toolkit/
+.moss-image-edit/
+.moss-image-edit-adapter/
 
 # Runtime output
 outputs/

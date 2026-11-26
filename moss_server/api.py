@@ -28,6 +28,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .config import Config
+from .edit import EditError, EditService
 from .engine import MossEngine
 from .lora import scan_lora_dirs
 from .schemas import (
@@ -36,7 +37,9 @@ from .schemas import (
     ImagesResponse,
     LoRALoadRequest,
     LoRAScaleRequest,
+    MossEditRequest,
     NativeGenerationRequest,
+    build_edit_request,
     build_generation_request,
 )
 
@@ -91,26 +94,29 @@ def _encode_response(images, response_format: str, config: Config, seconds: floa
 
 def create_app(config: Config) -> FastAPI:
     engine = MossEngine(config)
+    edit = EditService(config, engine=engine)
 
     async def _watchdog(stop: asyncio.Event) -> None:
         """Release the model after the configured idle period."""
         idle = config.idle_unload_seconds
-        if idle <= 0:
-            return
-        interval = max(5.0, min(30.0, idle / 4))
+        interval = max(5.0, min(30.0, (idle or 600) / 4))
         while not stop.is_set():
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
                 return
             except asyncio.TimeoutError:
                 pass
-            if engine.state != "ready" or engine.idle_seconds() < idle:
-                continue
+            if idle > 0 and engine.state == "ready" and engine.idle_seconds() >= idle:
+                try:
+                    if await asyncio.to_thread(engine.maybe_unload, idle):
+                        LOGGER.info("Idle for %.0fs: model unloaded", idle)
+                except Exception:  # noqa: BLE001 - watchdog must survive
+                    LOGGER.exception("idle unload failed")
             try:
-                if await asyncio.to_thread(engine.maybe_unload, idle):
-                    LOGGER.info("Idle for %.0fs: model unloaded", idle)
+                if await asyncio.to_thread(edit.maybe_idle_stop):
+                    LOGGER.info("Idle edit worker stopped")
             except Exception:  # noqa: BLE001 - watchdog must survive
-                LOGGER.exception("idle unload failed")
+                LOGGER.exception("idle edit-worker stop failed")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -135,6 +141,10 @@ def create_app(config: Config) -> FastAPI:
             watchdog.cancel()
             if eager is not None and not eager.done():
                 eager.cancel()
+            try:
+                await asyncio.to_thread(edit.stop, "server shutdown")
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                LOGGER.exception("could not stop the edit worker")
 
     app = FastAPI(
         title="MOSS-Image Server (ai-toolkit engine)",
@@ -148,6 +158,7 @@ def create_app(config: Config) -> FastAPI:
     )
     app.state.config = config
     app.state.engine = engine
+    app.state.edit = edit
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -196,6 +207,10 @@ def create_app(config: Config) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
         await acquire_gpu()
         try:
+            # The edit worker and the text-to-image engine both want the card;
+            # give editing's VRAM back before the engine loads.
+            if getattr(config, "edit_free_t2i", True):
+                await asyncio.to_thread(edit.stop, "text-to-image request")
             started = time.perf_counter()
             # Loads the model on the first call, then generates.
             images = await asyncio.to_thread(engine.generate, request)
@@ -217,9 +232,10 @@ def create_app(config: Config) -> FastAPI:
             "api": {
                 "openai": "POST /v1/images/generations",
                 "native": "POST /v1/moss/generate",
+                "edit": "POST /v1/moss/edit",
                 "stream": "POST /v1/moss/generate?stream=true",
                 "loras": "GET/POST /v1/loras",
-                "admin": "POST /v1/admin/load, POST /v1/admin/unload",
+                "admin": "POST /v1/admin/load, POST /v1/admin/unload, POST /v1/admin/edit/unload",
                 "files": "GET /files/{date}/{file}.png",
             },
         }
@@ -231,6 +247,7 @@ def create_app(config: Config) -> FastAPI:
             "version": __version__,
             "model_loaded": engine.ready,
             "idle_unload_seconds": config.idle_unload_seconds,
+            "edit_available": edit.availability()[0],
         }
         if engine.error:
             body["error"] = engine.error
@@ -243,6 +260,7 @@ def create_app(config: Config) -> FastAPI:
         info["version"] = __version__
         info["lazy_load"] = config.lazy_load
         info["queue_timeout"] = config.queue_timeout
+        info["edit"] = edit.status()
         return info
 
     @app.get("/v1/models", dependencies=[Depends(require_auth)])
@@ -326,6 +344,80 @@ def create_app(config: Config) -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    # ---------------------------------------------------------------- editing
+    @app.get("/v1/edit/status", dependencies=[Depends(require_auth)])
+    async def edit_status():
+        return edit.status()
+
+    @app.post("/v1/admin/edit/unload", dependencies=[Depends(require_auth)])
+    async def edit_unload():
+        stopped = await asyncio.to_thread(edit.stop, "admin request")
+        return {"stopped": stopped, **edit.status()}
+
+    @app.post("/v1/moss/edit", dependencies=[Depends(require_auth)])
+    async def moss_edit(body: MossEditRequest):
+        """Edit reference image(s) with a text instruction (Moss-Image-Edit)."""
+        available, reason = edit.availability()
+        if not available:
+            raise HTTPException(
+                status_code=503, detail=f"reference editing is unavailable: {reason}"
+            )
+        try:
+            request, _, _ = build_edit_request(
+                body,
+                default_width=config.default_width,
+                default_height=config.default_height,
+                max_pixels=config.max_pixels,
+                default_steps=config.edit_steps,
+                default_guidance=config.edit_guidance_scale,
+                default_shift=config.edit_shift,
+                max_ref_images=config.edit_max_ref_images,
+                default_max_edge=config.edit_max_edge,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        await acquire_gpu()
+        try:
+            started = time.perf_counter()
+            result = await asyncio.to_thread(edit.edit, request)
+            elapsed = time.perf_counter() - started
+        except EditError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        finally:
+            app.state.semaphore.release()
+
+        if body.response_format == "b64_json":
+            buffer = BytesIO()
+            result.image.save(buffer, format="PNG")
+            payload = {"b64_json": base64.b64encode(buffer.getvalue()).decode("ascii")}
+        else:
+            _, url = _save_image(result.image, config)
+            payload = {"url": url}
+        return {
+            "created": int(time.time()),
+            "model": "moss-image-edit",
+            "data": [
+                {
+                    **payload,
+                    "seed": result.seed,
+                    "width": result.width,
+                    "height": result.height,
+                    "seconds": round(result.seconds, 2),
+                }
+            ],
+            "seed": result.seed,
+            "seconds": round(elapsed, 2),
+            "edit": {
+                "references": result.references,
+                "steps": result.steps,
+                "guidance_scale": result.cfg,
+                "shift": result.shift,
+                "encode_seconds": result.encode_seconds,
+                "worker_load_seconds": round(edit.status().get("load_seconds") or 0.0, 2),
+            },
+        }
 
     # ------------------------------------------------------------------ LoRA
     def _lora_snapshot() -> dict:

@@ -27,6 +27,12 @@ Third-party components
   https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT
 * ai-toolkit (inference engine, loaded at runtime, not vendored): MIT,
   https://github.com/ostris/ai-toolkit
+* Moss-Image-Edit (reference-image editing, optional, installed separately and
+  run in its own process - no GPL code is copied into this repository): GPL-3.0,
+  https://github.com/Chenkin-x/Moss-Image-Edit
+* moss-image-prompt-skill (prompt rules, read from disk at runtime, never
+  vendored or modified): CC BY-NC-ND 4.0,
+  https://github.com/Moeblack/moss-image-prompt-skill
 * AstrBot (plugin host, optional): AGPL-3.0, https://github.com/AstrBotDevs/AstrBot
 * MOSS-Image prompt/layout skill texts reproduced by the plugin:
   Apache-2.0, https://github.com/OpenMOSS/MOSS-Image
