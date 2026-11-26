@@ -6,7 +6,7 @@ desc: >-
   支持按文字指令改图（Moss-Image-Edit，1-4 张参考图）与带文字定位的 Layout 排版；
   提示词规则来自独立 skill（moss-image-prompt-skill，运行时读取，不内置）；
   注册 moss_draw_image / moss_edit_image 两个 LLM 工具，让 AI 自主决定画图、改图与 LoRA 权重。
-version: 1.2.0
+version: 1.2.1
 author: DeepSeek Harness
 repo: https://github.com/XueNianOfficial/moss-image-astrbot
 astrbot_version: ">=4.16,<5"

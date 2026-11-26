@@ -20,6 +20,7 @@ from disk, never vendored).  LLM tools ``moss_draw_image`` and
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import re
 import time
@@ -47,7 +48,7 @@ from .prompt_skill import PromptSkill, SkillPrompter, clean_caption
 TOOL_NAME = "moss_draw_image"
 EDIT_TOOL_NAME = "moss_edit_image"
 #: Bumped when the handler contract changes; shows up in the load log.
-PLUGIN_BUILD = "3-edit-skill"
+PLUGIN_BUILD = "4-retry-register"
 
 _COMMAND_RE = re.compile(
     r"^[/!#]?\s*(draw|moss|绘图|画图|画画|生图)\b\s*[:：]?\s*", re.IGNORECASE
@@ -219,6 +220,7 @@ class MossImagePlugin(Star):
             allow_bot_choice=self.settings.lora_allow_bot_choice,
         )
         self._last_request: dict[str, float] = {}
+        self._retry_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -246,6 +248,35 @@ class MossImagePlugin(Star):
                 "只会按用户原文出图；把 SKILL.md 放到 AstrBot 的 skills 目录或在配置里填写路径"
             )
         await self._register_catalog()
+        if self._needs_registration():
+            # AstrBot can start before the MOSS server (cold boot, autostart race),
+            # so keep retrying in the background instead of silently drawing
+            # without the catalog LoRAs.
+            self._retry_task = asyncio.create_task(self._registration_retry())
+
+    def _needs_registration(self) -> bool:
+        return any(
+            entry.enabled and not entry.registered for entry in self.catalog.entries
+        ) and self.settings.lora_enabled
+
+    async def _registration_retry(self, attempts: int = 20, interval: float = 20.0) -> None:
+        """Wait for the server and register the catalog, then stop."""
+        for attempt in range(1, attempts + 1):
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+            if not self._needs_registration():
+                return
+            try:
+                await self.client.health()
+            except MossError:
+                continue
+            await self._register_catalog()
+            if not self._needs_registration():
+                logger.info("[moss_image] LoRA 目录已补注册（服务端在插件之后启动）")
+                return
+        logger.warning("[moss_image] LoRA 目录仍未能注册，请检查服务端是否运行")
 
     async def _register_catalog(self) -> None:
         """Declare every catalog LoRA to the server (registry only, no model load)."""
@@ -262,6 +293,9 @@ class MossImagePlugin(Star):
         )
 
     async def terminate(self) -> None:
+        task = getattr(self, "_retry_task", None)
+        if task is not None and not task.done():
+            task.cancel()
         await self.client.close()
 
     # ------------------------------------------------------------------ #
@@ -866,6 +900,8 @@ class MossImagePlugin(Star):
 
         # LoRA set + strengths for this request. Disabled entries ride along at
         # weight 0 so ai-toolkit only updates strengths instead of reloading.
+        if self._needs_registration():
+            await self._register_catalog()
         weights, lora_warnings = self.catalog.resolve(request.loras)
         warnings.extend(lora_warnings)
         triggers = self.catalog.trigger_words(weights)
