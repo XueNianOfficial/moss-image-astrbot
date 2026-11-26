@@ -10,8 +10,9 @@
 - **低显存**：int8 `convrot8` 量化 + 分层卸载，实测 1024² 峰值 12.6 GiB、空闲卸载后 2.7 GiB
 - **不合并权重**：LoRA 通过 forward hook 动态挂载，换 LoRA / 改强度不重载模型
 - **空闲自动卸载**：默认 10 分钟没有请求就把显存还回去，下个请求再懒加载
-- **图像参考编辑**：接入 [Moss-Image-Edit](https://github.com/Chenkin-x/Moss-Image-Edit)，
-  按文字指令换背景 / 换装 / 换光线，支持 1-4 张参考图，参考图 KV 缓存复用
+- **图像参考编辑**：同一个 ai-toolkit 引擎加载 [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit)
+  的编辑 LoRA，按文字指令换背景 / 换装 / 换光线，支持 1-4 张参考图；参考图以干净 latent 进入，
+  K/V 缓存跨采样步复用
 - **提示词交给独立 skill**：[moss-image-prompt-skill](https://github.com/Moeblack/moss-image-prompt-skill)
   运行时从磁盘读取，插件不内置任何提示词规则（也不打包其内容）
 - **Layout Enhancer**：海报/带文字排版，LLM 只写草稿框，坐标换算走官方 `compile_prompt`
@@ -24,7 +25,7 @@
 
 > 左：风格 LoRA @0.7，1024²/20 步，17 s ｜ 右：角色 LoRA @1.0，768²/12 步，7 s
 >
-> 改图示例：同一张图「把背景换成晴天的海边，保留角色」→ 1024²/12 步，约 40 s（worker 已热）
+> 改图示例：同一张图「把背景换成晴天的海边，保留角色」→ 1024²/12 步，模型热态 **13 s**
 
 ## 工作原理
 
@@ -34,18 +35,21 @@ AstrBot ──/draw───► 插件（skill 写提示词、Layout、LoRA 选�
                             │ HTTP /v1/moss/generate   /v1/moss/edit
                             ▼
                   MOSS-Image 服务（FastAPI）
+                            │  懒加载 / 空闲卸载 / LoRA 注册表
+                            ▼
+              ai-toolkit 推理引擎（MOSS-Image 模型）
         ┌───────────────────┴────────────────────┐
-        ▼                                        ▼
-  ai-toolkit 推理引擎                     edit worker 子进程
-  （convrot8 int8、层卸载、              （官方 diffusers transformer
-    hook LoRA）                            + Moss-Image-Edit LoRA）
-        ▼                                        ▼
-  MOSS-Image-SFT + 你的 LoRA            参考图 + 指令 → 编辑结果
+        │  prompt       → 文本 token + 目标 latent │  文生图
+        │  prompt+参考图 → 文本 token + 参考 latent │  改图（t=0 调制，
+        └────────────────────────────────────────┘   参考 K/V 缓存）
+                            │
+                            ▼
+        MOSS-Image-SFT（convrot8 int8）+ 你的 LoRA / 编辑 LoRA
 ```
 
-两个模型走两条互不干扰的通路：文本生图用 ai-toolkit 的量化引擎，改图用官方
-transformer 的参考图分支（需要干净的 bf16 权重和独立的 KV 缓存）。它们在**不同进程**
-里，服务端会按需启动 / 关闭改图 worker，所以显存不会互相抢占。
+改图不是另一套模型：ai-toolkit 的 MOSS 实现本身就有参考图分支（参考 token 以 t=0
+调制、只与自身互相可见、K/V 可跨步缓存），所以服务端只是额外挂一个编辑 LoRA，并把参考图
+作为 `ctrl_img` 传进去。加载、量化、层卸载、懒加载、空闲卸载全部与文生图共用同一套代码。
 
 模型加载、量化、采样、LoRA 解析全部由 [ai-toolkit](https://github.com/ostris/ai-toolkit)
 的推理引擎完成——本仓库只做服务化、调度和插件，所以能跟着 ai-toolkit 一起升级。
@@ -75,7 +79,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 → 从 Hugging Face 下载模型 → 生成 `config.toml` → 安装 AstrBot 插件 →（可选）注册开机自启。
 
 默认还会装好**改图**与**提示词 skill** 两个可选件（下载约 300 MB 的编辑 LoRA、克隆
-Moss-Image-Edit 与 moss-image-prompt-skill）。不想要可以加 `-SkipEdit` / `-SkipSkill`。
+编辑 LoRA 与 moss-image-prompt-skill）。不想要可以加 `-SkipEdit` / `-SkipSkill`。
 
 常用参数：
 
@@ -83,7 +87,7 @@ Moss-Image-Edit 与 moss-image-prompt-skill）。不想要可以加 `-SkipEdit` 
 .\install.ps1 -Autostart                        # 顺便设置开机自启
 .\install.ps1 -ModelDir D:\models\MOSS-Image-SFT -SkipModel   # 已有模型
 .\install.ps1 -SkipPlugin                       # 只装服务端
-.\install.ps1 -SkipEdit                         # 不装改图（少 300 MB / 少一个 GPL 依赖）
+.\install.ps1 -SkipEdit                         # 不装改图（少 300 MB）
 .\install.ps1 -Cpu                              # 只验证接线（CPU 推理极慢）
 ```
 
@@ -105,10 +109,9 @@ python -m venv ../ai-toolkit/.venv
 hf download OpenMOSS-Team/MOSS-Image-SFT --local-dir D:/models/MOSS-Image-SFT
 cp config.example.toml config.toml   # 改 aitk_root / model_dir
 
-# 可选：改图（GPL-3.0 外部依赖，不打包进本仓库）
-git clone https://github.com/Chenkin-x/Moss-Image-Edit .moss-image-edit
+# 可选：改图（只需要编辑 LoRA，运行时融合成 ai-toolkit 的 qkv 布局）
 hf download chinoll/Moss-Image-Edit --local-dir .moss-image-edit-adapter
-# 然后在 config.toml 里设置 edit_repo / edit_adapter
+# 然后在 config.toml 里设置 edit_adapter
 
 # 可选：提示词 skill（CC BY-NC-ND 4.0，不打包进本仓库）
 git clone https://github.com/Moeblack/moss-image-prompt-skill \
@@ -146,7 +149,7 @@ curl -X POST http://127.0.0.1:8000/v1/moss/edit \
 /draw 雨夜的霓虹街道，一只白狐回头 --size 1024x1536 --steps 30
 /edit 把背景换成晴天的海边，保留人物        # 图片和指令一起发，或引用一张图
 /loras              # 查看 LoRA 目录
-/drawstatus         # 服务状态、模型、显存、skill、改图 worker
+/drawstatus         # 服务状态、模型、显存、skill、改图状态
 ```
 
 插件注册了 LLM 工具 `moss_draw_image` 与 `moss_edit_image`，支持工具调用的模型会自己
@@ -170,11 +173,11 @@ curl -X POST http://127.0.0.1:8000/v1/moss/edit \
 | `default_uncond_skip_layers` | `[22]` | CFG 跳过的 DiT 层 |
 | `loras` | `[]` | 启动时注册的 LoRA（插件会自己注册，通常留空） |
 | `lora_mode` | `hook` | `hook`=动态挂载，`merge`=写入权重 |
-| `edit_repo` | `""` | Moss-Image-Edit 检出目录；留空 = 关闭改图 |
 | `edit_adapter` | `""` | 编辑 LoRA 目录（`adapter_config.json` + `adapter_model.safetensors`） |
 | `edit_steps` / `edit_guidance_scale` | `20` / `4.0` | 改图默认采样参数 |
 | `edit_max_ref_images` / `edit_max_edge` | `4` / `1024` | 参考图数量与长边上限 |
-| `edit_idle_unload_seconds` | `600` | 改图 worker 空闲多久退出并释放显存 |
+| `edit_uncond_skip_layers` | `[]` | 改图的 CFG 跳过层（编辑 LoRA 训练时未跳过） |
+| `edit_idle_unload_seconds` | `600` | 改图模型空闲多久卸载并释放显存 |
 | `edit_free_t2i` | `true` | 启动改图前先卸载文生图引擎 |
 
 插件配置（WebUI 里可直接改）：负面提示词、步数、CFG、shift、CFG 跳过层、LoRA 目录文本、
@@ -192,13 +195,13 @@ prompt skill 路径与章节、改图开关、冷却与权限等。LoRA 目录�
 | `POST` | `/v1/moss/edit` | **图像参考编辑**（参考图 + 指令） |
 | `POST` | `/v1/images/generations` | OpenAI 兼容 |
 | `POST` | `/v1/moss/generate?stream=true` | SSE 进度流 |
-| `GET` | `/v1/status` | 状态、LoRA、显存、统计、改图 worker |
-| `GET` | `/v1/edit/status` | 改图可用性与 worker 状态 |
+| `GET` | `/v1/status` | 状态、LoRA、显存、统计、改图状态 |
+| `GET` | `/v1/edit/status` | 改图可用性与模型状态 |
 | `POST` | `/v1/loras/load` | 注册 LoRA（不加载模型） |
 | `POST` | `/v1/loras/{name}/scale` | 改全局强度 |
 | `DELETE` | `/v1/loras/{name}` | 移除 |
 | `POST` | `/v1/admin/unload` / `/load` | 手动释放/预加载 |
-| `POST` | `/v1/admin/edit/unload` | 立即关闭改图 worker |
+| `POST` | `/v1/admin/edit/unload` | 立即卸载改图模型 |
 
 文生图请求体：
 
@@ -242,8 +245,8 @@ prompt skill 路径与章节、改图开关、冷却与权限等。LoRA 目录�
 | 768² / 12 步 | 7 s |
 | 模型加载 | ~20 s（懒加载，首次请求） |
 | 空闲卸载后显存 | 2.7 GiB |
-| 改图 worker 加载 | ~18 s（bf16 全精度 + LoRA） |
-| 改图 1024² / 12 步（热） | 约 37 s（编码 18 s + 采样 16 s） |
+| 改图模型加载 | ~21 s（与文生图同一套 convrot8 量化） |
+| 改图 1024² / 12 步（热） | **13 s** |
 
 ## LoRA
 
@@ -260,9 +263,10 @@ curl -X POST http://127.0.0.1:8000/v1/loras/load -H "Content-Type: application/j
 ## 目录结构
 
 ```
-moss_server/        推理服务（FastAPI + 引擎封装 + LoRA 注册表 + 改图 worker + 校验）
-  edit.py           改图服务：管理 worker 进程、空闲退出、与文生图引擎互斥
-  edit_worker.py    常驻改图进程（官方 transformer + Moss-Image-Edit LoRA）
+moss_server/        推理服务（FastAPI + 引擎封装 + LoRA 注册表 + 改图 + 校验）
+  edit.py           改图服务：请求编排、参考图落盘、空闲卸载、与文生图互斥
+  edit_lora.py      把 Moss-Image-Edit 适配器融合成 ai-toolkit 的 qkv 布局（带缓存）
+  engine.py         MossEngine（文生图）与 MossEditEngine（参考图编辑）
 plugin/             AstrBot 插件（命令、两个 LLM 工具、prompt skill 加载、LoRA 目录）
 scripts/            冒烟测试、压测、画质检查
 tests/              单元测试 + 插件集成测试（无需 GPU 的部分可直接跑）
@@ -275,7 +279,7 @@ config.example.toml 配置模板
 ```bash
 python tests/test_schemas.py          # 请求/配置校验（无需 GPU）
 python tests/test_lora.py             # LoRA 注册表 + 头扫描
-python tests/test_edit.py             # 改图请求/配置/worker 生命周期（无需 GPU）
+python tests/test_edit.py             # 改图请求、适配器融合、生命周期（无需 GPU）
 python tests/test_prompt_skill.py     # skill 解析与输出契约（MOSS_TEST_SKILL=<SKILL.md>）
 python tests/test_plugin_helpers.py   # 插件纯函数（解析、提示词、布局）
 python tests/test_plugin_integration.py   # 需要服务端 + AstrBot（MOSS_TEST_EDIT=1 跑真实改图）
@@ -296,11 +300,11 @@ python scripts/smoke_test.py          # 端到端
 | --- | --- | --- |
 | MOSS-Image 权重 | Apache-2.0 | Hugging Face |
 | ai-toolkit | MIT | 推理引擎，运行时导入 |
-| Moss-Image-Edit | **GPL-3.0** | 改图必需；作为独立进程/外部依赖使用，不并入本仓库代码 |
 | moss-image-prompt-skill | **CC BY-NC-ND 4.0** | 提示词规则；运行时从磁盘读取，不复制、不改写、不商用 |
 | AstrBot | AGPL-3.0 | 插件宿主 |
 
-如果你要分发包含改图的整套环境，请自行确认 GPL-3.0 与 CC BY-NC-ND 4.0 的合规性。
+编辑 LoRA 权重（chinoll/Moss-Image-Edit）由用户自行下载；本项目只做格式转换，不打包权重，
+使用该权重请遵守其发布页的授权说明。
 
 ## 致谢
 

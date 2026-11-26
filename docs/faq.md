@@ -67,21 +67,20 @@ CPU 推理（`-Cpu`）只适合验证接线，一张 1024² 图要几十分钟�
 ## 改图（/edit）
 
 **Q: `/edit` 提示「改图功能不可用」或 503**
-服务端必须配好 `edit_repo` 与 `edit_adapter`，并且适配器目录里要有
-`adapter_config.json` + `adapter_model.safetensors`。先 `GET /v1/edit/status` 看 `reason`。
+服务端必须配好 `edit_adapter`，目录里要有 `adapter_config.json` +
+`adapter_model.safetensors`。先 `GET /v1/edit/status` 看 `reason`。
 
 **Q: `/edit` 说没找到图片**
 图片要和指令一起发，或者**引用（回复）**一张带图的消息。部分适配器的引用消息只带 id，
 插件会调 `get_msg` 再取一次；如果仍取不到，请直接把图片和指令放在同一条消息里。
 
 **Q: 第一次改图特别慢**
-worker 冷启动要加载 bf16 全精度 transformer + LoRA（约 18 s），之后同一进程内热请求约 37 s
-（1024²/12 步：编码 18 s + 采样 16 s）。空闲 `edit_idle_unload_seconds` 后 worker 退出，
-下次再付一次冷启动代价。
+改图模型走与文生图相同的加载路径（convrot8 量化），冷启动约 21 s；模型热态下
+1024²/12 步约 13 s。空闲 `edit_idle_unload_seconds` 后模型卸载，下次再付一次加载代价。
 
 **Q: 改图会把我文生图的模型顶掉**
-默认 `edit_free_t2i = true`：启动改图 worker 前会先卸载文生图引擎，避免 32 GiB 卡上互相抢显存。
-两张卡或显存充裕可以设 `false` 让它们共存。
+两者共用同一套引擎代码但各自持有模型，默认 `edit_free_t2i = true`：加载改图模型前会先
+卸载文生图模型，避免互相抢显存。显存充裕可以设 `false` 让它们共存（切换时互不卸载）。
 
 **Q: 改图结果和原图差太多 / 完全没改**
 编辑 LoRA 对指令很敏感：要写清「改什么」+「保留什么」（例：`把背景换成晴天的海边，保留人物和姿势`）。

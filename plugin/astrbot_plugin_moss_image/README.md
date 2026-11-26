@@ -11,7 +11,7 @@
 
 - 本机 MOSS-Image 服务（本仓库的服务端），默认监听 `http://127.0.0.1:8000`
   （装过开机自启会自动拉起；手动启动服务端目录下的 `run.ps1` / `run.bat`）
-- 改图需要服务端配好 `edit_repo` / `edit_adapter`
+- 改图需要服务端配好 `edit_adapter`（编辑 LoRA），与文生图共用 ai-toolkit 引擎
 - 提示词 skill 放在 `~/.astrbot/data/skills/moss-image-prompt-skill/SKILL.md`
 - 无额外 Python 依赖（仅用 AstrBot 自带的 aiohttp）
 
@@ -22,7 +22,7 @@
 | `/draw <描述>` | 出图，别名 `/绘图` `/画图` `/画画` `/moss` `/生图` |
 | `/edit <指令>` | 改图（图与指令同发，或引用图片），别名 `/改图` `/编辑图片` `/修图` |
 | `/drawhelp` | 用法说明 |
-| `/drawstatus` | 服务状态、模型、显存、skill 与改图 worker |
+| `/drawstatus` | 服务状态、模型、显存、skill 与改图状态 |
 | `/loras` | 查看 LoRA 目录（名称/权重/描述/启用状态） |
 | `/drawunload` | 立即卸载模型释放显存 |
 | `/enhance <描述>` | 只预览 skill 写出的提示词，不画图 |
@@ -173,11 +173,11 @@ astrbot_plugin_moss_image/
 服务没起来。运行服务端目录下的 `run.ps1`（或装好的开机自启）；`/drawstatus` 可看连接状态。
 
 **第一次出图 / 改图特别慢**
-服务是懒加载的：第一个请求先加载模型（约 20 秒）。改图 worker 冷启动约 18 秒，
-之后热请求 1024²/12 步约 37 秒；空闲 10 分钟自动退出并释放显存。
+服务是懒加载的：第一个请求先加载模型（约 20 秒）。改图模型冷启动约 21 秒，
+热态 1024²/12 步约 13 秒；空闲 10 分钟自动卸载并释放显存。
 
 **改图报「改图功能不可用」**
-服务端没配 `edit_repo` / `edit_adapter`。`/drawstatus` 会显示原因，
+服务端没配 `edit_adapter`。`/drawstatus` 会显示原因，
 或 `GET /v1/edit/status` 看 `reason`。
 
 **`/edit` 说没找到图片**

@@ -69,23 +69,24 @@ lora_mode = "hook"
 lora_dirs = []
 
 # --- reference editing (Moss-Image-Edit) ----------------------------------
-# Editing ("改图") is a separate pipeline: it needs the edit LoRA and a checkout
-# of https://github.com/Chenkin-x/Moss-Image-Edit, which is GPL-3.0 and is used
-# as an external runtime dependency (never vendored into this MIT project).
-# Leave the two paths empty (or set edit_enabled = false) to disable it.
+# Editing runs on the *same* ai-toolkit engine as text-to-image: the reference
+# branch (clean latents at t=0, isolated reference K/V) is part of ai-toolkit's
+# MOSS model, so only the edit LoRA adapter is needed. Download it with:
+#   hf download chinoll/Moss-Image-Edit --local-dir <dir>
+# The adapter is fused into ai-toolkit's qkv layout once, on first use.
+# Leave edit_adapter empty (or set edit_enabled = false) to disable editing.
 edit_enabled = true
-edit_repo = ""
 edit_adapter = ""
-# Interpreter for the edit worker; empty = the interpreter running the server.
-edit_python = ""
 edit_steps = 20
 edit_guidance_scale = 4.0
 edit_shift = 5.0
+# The edit LoRA was trained without CFG skip blocks.
+edit_uncond_skip_layers = []
 edit_max_ref_images = 4
 edit_max_edge = 1024
-# Stop the edit worker (and free its VRAM) after this many idle seconds.
+# Unload the edit model after this many idle seconds (frees its VRAM).
 edit_idle_unload_seconds = 600
-# Unload the text-to-image engine before the edit worker takes the card.
+# Unload the text-to-image model before the edit model takes the card.
 edit_free_t2i = true
 edit_timeout = 900.0
 

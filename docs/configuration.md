@@ -63,27 +63,28 @@ python -m moss_server --config config.toml --port 8000
 
 ### 图像参考编辑（Moss-Image-Edit）
 
-改图走独立进程（`moss_server/edit_worker.py`），因为官方 transformer 的参考图分支与
-ai-toolkit 的量化引擎无法共用一个解释器。两个路径都留空即关闭改图。
+改图与文生图共用同一个 ai-toolkit 引擎：ai-toolkit 的 MOSS 模型本身就有参考图分支
+（参考 token 走 t=0 调制、只与自身互相可见、K/V 跨步缓存），服务端只是额外挂一个编辑
+LoRA，并把参考图作为 `ctrl_img` 传进去。适配器第一次使用时会融合成 ai-toolkit 的
+`proj.qkv` 布局并缓存到 `output_dir/edit-lora/`。`edit_adapter` 留空即关闭改图。
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `edit_enabled` | `true` | 总开关；`--no-edit` 亦可 |
-| `edit_repo` | `""` | [Moss-Image-Edit](https://github.com/Chenkin-x/Moss-Image-Edit) 检出目录（需含 `moss_edit/`） |
-| `edit_adapter` | `""` | 编辑 LoRA 目录：`adapter_config.json` + `adapter_model.safetensors` |
-| `edit_python` | `""` | worker 的解释器；留空 = 服务端自己的解释器 |
+| `edit_adapter` | `""` | 编辑 LoRA 目录：`adapter_config.json` + `adapter_model.safetensors`（`hf download chinoll/Moss-Image-Edit --local-dir <dir>`） |
 | `edit_steps` / `edit_guidance_scale` | `20` / `4.0` | 默认步数与 CFG（官方示例常用 12-50 / 4.0） |
 | `edit_shift` | `5.0` | 采样 shift |
+| `edit_uncond_skip_layers` | `[]` | CFG 跳过层；编辑 LoRA 训练时未跳过 |
 | `edit_max_ref_images` | `4` | 参考图上限（1-8） |
 | `edit_max_edge` | `1024` | 参考图缩放后的长边 |
-| `edit_idle_unload_seconds` | `600` | worker 空闲多久退出；`0` = 一直驻留 |
-| `edit_free_t2i` | `true` | 启动 worker 前先卸载文生图引擎（反方向也成立） |
-| `edit_timeout` | `900` | 单次改图（含 worker 冷启动）的超时 |
+| `edit_idle_unload_seconds` | `600` | 改图模型空闲多久卸载；`0` = 一直驻留 |
+| `edit_free_t2i` | `true` | 加载改图模型前先卸载文生图模型（反方向也成立） |
+| `edit_timeout` | `900` | 单次改图（含模型冷启动）的超时 |
 
-CLI：`--edit-repo`、`--edit-adapter`、`--no-edit`、`--edit-idle-unload`、`--no-edit-free-t2i`。
+CLI：`--edit-adapter`、`--no-edit`、`--edit-uncond-skip-layers`、`--edit-idle-unload`、`--no-edit-free-t2i`。
 
-改图会占用约 11-12 GiB 显存（bf16 全精度 + LoRA，不做量化），因为编辑 LoRA 是在干净权重上训练的。
-显存不够时把 `edit_max_edge` 降到 768，或把 `edit_free_t2i` 保持 `true`。
+改图与文生图用同一套 convrot8 int8 量化，热态显存约 7-8 GiB；只有加载瞬间会短暂更高。
+显存紧张时把 `edit_max_edge` 降到 768，并保持 `edit_free_t2i = true`。
 
 ### HTTP
 

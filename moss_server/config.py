@@ -80,21 +80,20 @@ class Config:
     lora_dirs: list[str] = field(default_factory=list)
 
     # --- reference editing (Moss-Image-Edit) ------------------------------
-    # Editing needs a checkout of https://github.com/Chenkin-x/Moss-Image-Edit
-    # (GPL-3.0, an optional runtime dependency - it is never vendored here) and
-    # its LoRA adapter bundle.  Leave the paths empty to disable the feature.
+    # Editing runs on the same ai-toolkit engine as text-to-image; it only needs
+    # the edit LoRA adapter bundle.  The adapter is fused (q/k/v -> qkv) once at
+    # load time by moss_server.edit_lora, so no extra checkout is required.
     edit_enabled: bool = True
-    edit_repo: str = ""
     edit_adapter: str = ""
-    # Interpreter for the edit worker; empty = the interpreter running the server.
-    edit_python: str = ""
     edit_steps: int = 20
     edit_guidance_scale: float = 4.0
     edit_shift: float = 5.0
+    # The edit LoRA was trained without CFG skip blocks.
+    edit_uncond_skip_layers: list[int] = field(default_factory=list)
     edit_max_ref_images: int = 4
     edit_max_edge: int = 1024
     edit_idle_unload_seconds: int = 600
-    # Free the text-to-image engine before the edit worker takes the GPU.
+    # Free the text-to-image model before the edit model takes the GPU.
     edit_free_t2i: bool = True
     edit_timeout: float = 900.0
 
@@ -116,12 +115,8 @@ class Config:
             self.output_dir = str((base / self.output_dir).resolve())
         if self.vae_path:
             self.vae_path = str(Path(self.vae_path).expanduser().resolve())
-        if self.edit_repo:
-            self.edit_repo = str((base / Path(self.edit_repo).expanduser()).resolve())
         if self.edit_adapter:
             self.edit_adapter = str((base / Path(self.edit_adapter).expanduser()).resolve())
-        if self.edit_python:
-            self.edit_python = str(Path(self.edit_python).expanduser().resolve())
         self.loras = [str(Path(p).expanduser().resolve()) for p in self.loras if p]
         self.lora_dirs = [str(Path(p).expanduser().resolve()) for p in self.lora_dirs]
         if self.device == "auto":
@@ -149,12 +144,7 @@ class Config:
         if not Path(self.model_dir, "transformer").is_dir():
             raise ValueError(f"model_dir does not contain transformer/: {self.model_dir}")
         # Editing is optional: only validate paths that were actually given, so a
-        # text-to-image-only install does not have to ship the edit checkout.
-        if self.edit_enabled and self.edit_repo:
-            if not Path(self.edit_repo, "moss_edit", "model.py").is_file():
-                raise ValueError(
-                    f"edit_repo does not look like a Moss-Image-Edit checkout: {self.edit_repo}"
-                )
+        # text-to-image-only install does not have to ship the edit adapter.
         if self.edit_enabled and self.edit_adapter:
             if not Path(self.edit_adapter, "adapter_config.json").is_file():
                 raise ValueError(
@@ -276,18 +266,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", default=None, choices=("debug", "info", "warning", "error"))
     parser.add_argument("--no-warmup", action="store_true", default=None)
 
-    parser.add_argument("--edit-repo", default=None,
-                        help="checkout of Moss-Image-Edit (enables /v1/moss/edit)")
     parser.add_argument("--edit-adapter", default=None,
                         help="directory with adapter_config.json + adapter_model.safetensors")
-    parser.add_argument("--edit-python", default=None,
-                        help="interpreter for the edit worker (default: the server's own)")
     parser.add_argument("--no-edit", dest="edit_enabled", action="store_false", default=None,
                         help="disable reference editing entirely")
+    parser.add_argument("--edit-uncond-skip-layers", type=int, nargs="*", default=None,
+                        dest="edit_uncond_skip_layers",
+                        help="CFG skip blocks for editing (default: none)")
     parser.add_argument("--edit-idle-unload", type=int, default=None, dest="edit_idle_unload_seconds",
-                        help="seconds of inactivity before the edit worker is stopped (0 = never)")
+                        help="seconds of inactivity before the edit model is unloaded (0 = never)")
     parser.add_argument("--no-edit-free-t2i", dest="edit_free_t2i", action="store_false", default=None,
-                        help="keep the text-to-image engine loaded while editing")
+                        help="keep the text-to-image model loaded while editing")
     return parser
 
 

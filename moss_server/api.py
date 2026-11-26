@@ -114,9 +114,9 @@ def create_app(config: Config) -> FastAPI:
                     LOGGER.exception("idle unload failed")
             try:
                 if await asyncio.to_thread(edit.maybe_idle_stop):
-                    LOGGER.info("Idle edit worker stopped")
+                    LOGGER.info("Idle edit model unloaded")
             except Exception:  # noqa: BLE001 - watchdog must survive
-                LOGGER.exception("idle edit-worker stop failed")
+                LOGGER.exception("idle edit-model unload failed")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -144,7 +144,7 @@ def create_app(config: Config) -> FastAPI:
             try:
                 await asyncio.to_thread(edit.stop, "server shutdown")
             except Exception:  # noqa: BLE001 - shutdown must not raise
-                LOGGER.exception("could not stop the edit worker")
+                LOGGER.exception("could not unload the edit model")
 
     app = FastAPI(
         title="MOSS-Image Server (ai-toolkit engine)",
@@ -207,7 +207,7 @@ def create_app(config: Config) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
         await acquire_gpu()
         try:
-            # The edit worker and the text-to-image engine both want the card;
+            # The edit model and the text-to-image model both want the card;
             # give editing's VRAM back before the engine loads.
             if getattr(config, "edit_free_t2i", True):
                 await asyncio.to_thread(edit.stop, "text-to-image request")
@@ -414,8 +414,8 @@ def create_app(config: Config) -> FastAPI:
                 "steps": result.steps,
                 "guidance_scale": result.cfg,
                 "shift": result.shift,
-                "encode_seconds": result.encode_seconds,
-                "worker_load_seconds": round(edit.status().get("load_seconds") or 0.0, 2),
+                "engine": "ai-toolkit",
+                "load_seconds": round(edit.status().get("load_seconds") or 0.0, 2),
             },
         }
 

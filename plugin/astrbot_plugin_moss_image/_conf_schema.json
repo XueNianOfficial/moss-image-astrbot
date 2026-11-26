@@ -209,7 +209,7 @@
   "edit": {
     "description": "图像参考编辑（Moss-Image-Edit）",
     "type": "object",
-    "hint": "让 bot 按文字指令修改图片（换背景/换装/换光线）。需要服务端配置好 edit_repo 与 edit_adapter。",
+    "hint": "让 bot 按文字指令修改图片（换背景/换装/换光线）。需要服务端配置好 edit_adapter（编辑 LoRA），与文生图共用同一引擎。",
     "items": {
       "enabled": {
         "description": "启用 /edit 与 moss_edit_image",

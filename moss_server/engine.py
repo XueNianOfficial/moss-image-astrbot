@@ -64,6 +64,23 @@ class GeneratedImage:
 
 
 @dataclass
+class EditRequest:
+    """One reference-edit request; ``references`` are absolute image paths."""
+
+    prompt: str
+    references: list[str]
+    negative_prompt: str = ""
+    height: int = 1024
+    width: int = 1024
+    steps: int = 20
+    guidance_scale: float = 4.0
+    seed: int | None = None
+    shift: float | None = None
+    uncond_skip_layers: tuple[int, ...] | None = None
+    progress: ProgressCallback | None = None
+
+
+@dataclass
 class EngineStats:
     requests: int = 0
     images: int = 0
@@ -446,4 +463,143 @@ class MossEngine:
             "last_steps": self.stats.last_steps,
             "last_size": self.stats.last_size,
         }
+        return info
+
+
+class MossEditEngine(MossEngine):
+    """Reference-image editing on the same ai-toolkit engine.
+
+    ai-toolkit's MOSS transformer already implements the reference branch that
+    Moss-Image-Edit was trained with: clean reference latents ride after the
+    text tokens with t=0 modulation, reference queries attend only to
+    references, and their per-block K/V can be cached across sampling steps.
+    Enabling it only needs ``model_kwargs.edit`` / ``kv_cache`` plus the edit
+    LoRA, so editing shares loading, quantisation, offloading and lazy-unload
+    with text-to-image instead of running a second model in another process.
+
+    Two adjustments are made on top of the stock model:
+
+    * the edit LoRA is the *fused* adapter (see ``edit_lora``) because the
+      transformer keeps q/k/v as one ``proj.qkv`` linear;
+    * ``encode_control_in_text_embeddings`` is turned off after loading. The
+      stock path also feeds references through the Qwen vision tower, but
+      Moss-Image-Edit was trained with text-only prompts and reference latents,
+      so adding vision tokens shifts the prompt distribution.
+    """
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.fused_lora: Path | None = None
+
+    # ---------------------------------------------------------------- spec
+    def _model_spec(self, loras: list[dict] | None = None) -> dict:
+        cfg = self.config
+        fused = self.fused_lora
+        if fused is None:
+            raise RuntimeError(
+                "edit adapter is not ready; call prepare_adapter() before loading"
+            )
+        spec = super()._model_spec(loras=[{"path": str(fused), "strength": 1.0}])
+        spec["model_kwargs"] = {
+            "edit": True,
+            "kv_cache": True,
+            "uncond_skip_layers": list(cfg.edit_uncond_skip_layers),
+            "sample_shift": float(cfg.edit_shift),
+            "max_text_length": int(cfg.default_max_sequence_length),
+            "control_image_max_pixels": int(cfg.edit_max_edge) ** 2,
+            "match_target_res": False,
+        }
+        return spec
+
+    def prepare_adapter(self) -> Path:
+        """Fuse (once) and remember the edit LoRA ai-toolkit can load."""
+        from .edit_lora import ensure_fused_adapter
+
+        adapter = Path(self.config.edit_adapter)
+        cache_dir = Path(self.config.output_dir) / "edit-lora"
+        self.fused_lora = ensure_fused_adapter(adapter, cache_dir)
+        return self.fused_lora
+
+    def _load(self) -> None:
+        if self.fused_lora is None:
+            self.prepare_adapter()
+        super()._load()
+        holder = getattr(self.engine, "holder", None)
+        if holder is not None:
+            holder.encode_control_in_text_embeddings = False
+            LOGGER.info(
+                "Edit model ready: references enter as clean latents only "
+                "(vision-tower prompt encoding disabled)"
+            )
+
+    # ------------------------------------------------------------- generate
+    def warmup(self) -> float:
+        # A text-to-image warmup would edit nothing and cost a full model load;
+        # the first real edit pays that once instead.
+        return 0.0
+
+    def edit(self, request: EditRequest) -> GeneratedImage:
+        with self.lock:
+            if not request.references:
+                raise ValueError("at least one reference image is required")
+            limit = max(1, int(self.config.edit_max_ref_images))
+            if len(request.references) > limit:
+                raise ValueError(
+                    f"at most {limit} reference images are supported, got {len(request.references)}"
+                )
+            self.ensure_loaded()
+            holder = getattr(self.engine, "holder", None)
+            if holder is not None:
+                holder.sample_shift = float(
+                    request.shift if request.shift is not None else self.config.edit_shift
+                )
+                holder.uncond_skip_layers = tuple(
+                    request.uncond_skip_layers
+                    if request.uncond_skip_layers is not None
+                    else self.config.edit_uncond_skip_layers
+                )
+            started = time.perf_counter()
+            seed = int(request.seed) if request.seed is not None else int(
+                torch.randint(0, 2**31 - 1, (1,)).item()
+            )
+            sample = {
+                "prompt": request.prompt,
+                "negative_prompt": request.negative_prompt or "",
+                "width": int(request.width),
+                "height": int(request.height),
+                "num_inference_steps": int(request.steps),
+                "guidance_scale": float(request.guidance_scale),
+                "seed": seed,
+                "output_ext": "png",
+            }
+            for index, path in enumerate(request.references):
+                key = "ctrl_img" if index == 0 else f"ctrl_img_{index}"
+                sample[key] = str(path)
+            model = self._model_spec()
+            job = self.engine.submit(model, sample, {"latents": "none"})
+            self._wait(job, request.progress)
+            image = self._collect(job, seed)
+            total = time.perf_counter() - started
+            self.stats.requests += 1
+            self.stats.images += 1
+            self.stats.total_seconds += total
+            self.stats.last_seconds = total
+            self.stats.last_steps = request.steps
+            self.stats.last_size = (request.width, request.height)
+            self.touch()
+            LOGGER.info(
+                "Edited %d ref(s) to %dx%d in %d steps, %.1fs",
+                len(request.references), request.width, request.height, request.steps, total,
+            )
+            return image
+
+    # --------------------------------------------------------------- status
+    def describe(self) -> dict:
+        info = super().describe()
+        info["mode"] = "edit"
+        info["edit_adapter"] = self.config.edit_adapter or None
+        info["edit_lora"] = str(self.fused_lora) if self.fused_lora else None
+        info["edit_steps"] = self.config.edit_steps
+        info["edit_max_ref_images"] = self.config.edit_max_ref_images
+        info["edit_max_edge"] = self.config.edit_max_edge
         return info

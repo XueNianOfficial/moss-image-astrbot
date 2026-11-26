@@ -10,7 +10,6 @@
 #   MODEL_DIR        where to put the model bundle  (default: <repo>/.models/MOSS-Image-SFT)
 #   MODEL_REPO       Hugging Face repo id           (default: OpenMOSS-Team/MOSS-Image-SFT)
 #   PLUGIN_DIR       AstrBot plugin directory       (default: ~/.astrbot/data/plugins)
-#   EDIT_DIR         where to clone Moss-Image-Edit (default: <repo>/.moss-image-edit)
 #   EDIT_ADAPTER_DIR where to put the edit LoRA     (default: <repo>/.moss-image-edit-adapter)
 #   EDIT_ADAPTER_REPO  Hugging Face edit LoRA repo  (default: chinoll/Moss-Image-Edit)
 #   SKILL_DIR        where to clone the prompt skill(default: ~/.astrbot/data/skills/moss-image-prompt-skill)
@@ -19,7 +18,7 @@
 #   SKIP_MODEL=1     skip the ~30 GB download
 #   SKIP_DEPS=1      skip venv + pip
 #   SKIP_PLUGIN=1    skip the AstrBot plugin
-#   SKIP_EDIT=1      skip the editing LoRA + Moss-Image-Edit checkout
+#   SKIP_EDIT=1      skip the editing LoRA download
 #   SKIP_SKILL=1     skip the prompt skill checkout
 #
 # Tested on Windows (install.ps1) and Linux with an NVIDIA GPU. CPU-only runs
@@ -29,7 +28,6 @@ set -euo pipefail
 
 AI_TOOLKIT_REPO="https://github.com/ostris/ai-toolkit.git"
 AI_TOOLKIT_COMMIT="04733873cf1da8060fce01316ec45daedbd4a918"
-EDIT_REPO_URL="https://github.com/Chenkin-x/Moss-Image-Edit.git"
 SKILL_REPO_URL="https://github.com/Moeblack/moss-image-prompt-skill.git"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,7 +35,6 @@ AITK="${AI_TOOLKIT_DIR:-$ROOT/.ai-toolkit}"
 MODEL="${MODEL_DIR:-$ROOT/.models/MOSS-Image-SFT}"
 MODEL_REPO="${MODEL_REPO:-OpenMOSS-Team/MOSS-Image-SFT}"
 PLUGIN_DIR="${PLUGIN_DIR:-$HOME/.astrbot/data/plugins}"
-EDIT_DIR="${EDIT_DIR:-$ROOT/.moss-image-edit}"
 EDIT_ADAPTER_DIR="${EDIT_ADAPTER_DIR:-$ROOT/.moss-image-edit-adapter}"
 EDIT_ADAPTER_REPO="${EDIT_ADAPTER_REPO:-chinoll/Moss-Image-Edit}"
 SKILL_DIR="${SKILL_DIR:-$HOME/.astrbot/data/skills/moss-image-prompt-skill}"
@@ -108,27 +105,19 @@ EDIT_READY=0
 if [ "${SKIP_EDIT:-0}" = "1" ]; then
     warn "editing skipped (SKIP_EDIT=1)"
 else
-    if [ -f "$EDIT_DIR/moss_edit/model.py" ]; then
-        ok "Moss-Image-Edit present: $EDIT_DIR"
-    else
-        ok "cloning Moss-Image-Edit (GPL-3.0, external dependency)"
-        git clone --depth 1 "$EDIT_REPO_URL" "$EDIT_DIR" || warn "clone failed; editing stays disabled"
-    fi
-    if [ -f "$EDIT_DIR/moss_edit/model.py" ]; then
-        if [ ! -f "$EDIT_ADAPTER_DIR/adapter_config.json" ]; then
-            ok "downloading the edit LoRA from $EDIT_ADAPTER_REPO (~300 MB)"
-            "$AITK/.venv/bin/python" - "$EDIT_ADAPTER_REPO" "$EDIT_ADAPTER_DIR" <<'PY'
+    if [ ! -f "$EDIT_ADAPTER_DIR/adapter_config.json" ]; then
+        ok "downloading the edit LoRA from $EDIT_ADAPTER_REPO (~300 MB)"
+        "$AITK/.venv/bin/python" - "$EDIT_ADAPTER_REPO" "$EDIT_ADAPTER_DIR" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
 snapshot_download(sys.argv[1], local_dir=sys.argv[2])
 PY
-        else
-            ok "edit LoRA present: $EDIT_ADAPTER_DIR"
-        fi
-        [ -f "$EDIT_ADAPTER_DIR/adapter_config.json" ] && EDIT_READY=1
+    else
+        ok "edit LoRA present: $EDIT_ADAPTER_DIR"
     fi
+    [ -f "$EDIT_ADAPTER_DIR/adapter_config.json" ] && EDIT_READY=1
 fi
-[ "$EDIT_READY" = "1" ] && ok "editing enabled" || warn "editing unavailable until edit_repo/edit_adapter are set"
+[ "$EDIT_READY" = "1" ] && ok "editing enabled (same ai-toolkit engine)" || warn "editing unavailable until edit_adapter is set"
 
 if [ "${SKIP_SKILL:-0}" = "1" ]; then
     warn "prompt skill skipped (SKIP_SKILL=1)"
@@ -147,7 +136,7 @@ CONFIG="$ROOT/config.toml"
 [ -f "$CONFIG" ] && cp "$CONFIG" "$CONFIG.bak-$(date +%Y%m%d-%H%M%S)" && warn "previous config backed up"
 EDIT_SED=""
 if [ "$EDIT_READY" = "1" ]; then
-    EDIT_SED="-e s|edit_repo = \"\"|edit_repo = \"$EDIT_DIR\"| -e s|edit_adapter = \"\"|edit_adapter = \"$EDIT_ADAPTER_DIR\"|"
+    EDIT_SED="-e s|edit_adapter = \"\"|edit_adapter = \"$EDIT_ADAPTER_DIR\"|"
 fi
 # shellcheck disable=SC2086
 sed -e "s|aitk_root = \"G:/ai-toolkit\"|aitk_root = \"$AITK\"|" \
@@ -156,9 +145,8 @@ sed -e "s|aitk_root = \"G:/ai-toolkit\"|aitk_root = \"$AITK\"|" \
     $EDIT_SED \
     "$ROOT/config.example.toml" > "$CONFIG"
 ok "config: $CONFIG"
-printf '{\n  "ai_toolkit": "%s",\n  "model_dir": "%s",\n  "edit_repo": "%s",\n  "edit_adapter": "%s",\n  "skill_dir": "%s"\n}\n' \
-    "$AITK" "$MODEL" "$([ "$EDIT_READY" = "1" ] && echo "$EDIT_DIR")" \
-    "$([ "$EDIT_READY" = "1" ] && echo "$EDIT_ADAPTER_DIR")" "$SKILL_DIR" > "$ROOT/.install.json"
+printf '{\n  "ai_toolkit": "%s",\n  "model_dir": "%s",\n  "edit_adapter": "%s",\n  "skill_dir": "%s"\n}\n' \
+    "$AITK" "$MODEL"     "$([ "$EDIT_READY" = "1" ] && echo "$EDIT_ADAPTER_DIR")" "$SKILL_DIR" > "$ROOT/.install.json"
 
 step 7/8 "Installing the AstrBot plugin"
 if [ "${SKIP_PLUGIN:-0}" = "1" ]; then
