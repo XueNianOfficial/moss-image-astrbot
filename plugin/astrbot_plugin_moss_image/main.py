@@ -49,7 +49,7 @@ from .prompt_skill import EDIT_SKILL_PATHS, PromptSkill, SkillPrompter, clean_ca
 TOOL_NAME = "moss_draw_image"
 EDIT_TOOL_NAME = "moss_edit_image"
 #: Bumped when the handler contract changes; shows up in the load log.
-PLUGIN_BUILD = "5-edit-multiref"
+PLUGIN_BUILD = "5-edit-multiref2"
 
 _COMMAND_RE = re.compile(
     r"^[/!#]?\s*(draw|moss|绘图|画图|画画|生图)\b\s*[:：]?\s*", re.IGNORECASE
@@ -783,6 +783,8 @@ class MossImagePlugin(Star):
 
         request = parse_draw_request("")
         request.text = self._normalise_prompt_argument(prompt) or ""
+        # parse_draw_request("") reports "no description"; the text is set above.
+        request.warnings = []
         if not request.text:
             return "缺少编辑指令。"
         if size:
@@ -799,7 +801,7 @@ class MossImagePlugin(Star):
         request.mode = "caption" if enhance else "raw"
 
         try:
-            components = await self._render_edit(event, request, images, warnings)
+            components = await self._render_edit(event, request, images_bytes, warnings)
         except MossTimeoutError as error:
             return f"改图超时：{error.user_message()}"
         except MossConnectionError as error:
