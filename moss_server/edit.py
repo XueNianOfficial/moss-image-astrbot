@@ -1,14 +1,13 @@
-"""Reference-image editing on the ai-toolkit engine.
+"""Reference-image editing on the shared ai-toolkit model.
 
-Editing shares the text-to-image stack: the same ai-toolkit engine loads the
-model, the same convrot8 quantisation and layer offloading apply, and the same
-lazy-load / idle-unload lifecycle keeps VRAM in check.  The only additions are
-the edit LoRA (fused once by :mod:`moss_server.edit_lora`) and reference images
-passed to the model as clean latents.
+There is no second model: ai-toolkit's MOSS transformer implements the reference
+branch Moss-Image-Edit was trained with, so editing flips three flags on the
+loaded holder (``is_edit``, ``kv_cache``, vision-prompt encoding) and hooks the
+edit LoRA for the duration of one request.  Text-to-image and editing therefore
+share one load, one copy of the weights and one VRAM budget.
 
-The service therefore owns a second :class:`~moss_server.engine.MossEditEngine`
-and serialises it against the text-to-image engine: both want the card, so a
-request on one side unloads the other when ``edit_free_t2i`` is enabled.
+This service owns the HTTP-facing concerns only: readiness checks, turning
+base64 payloads into files the engine can open, and reporting status.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import base64
 import logging
 import shutil
 import tempfile
-import threading
 import uuid
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -26,7 +24,6 @@ from typing import Callable
 
 from .edit_lora import AdapterError, adapter_signature
 from .engine import EditRequest as EngineEditRequest
-from .engine import MossEditEngine
 
 LOGGER = logging.getLogger(__name__)
 
@@ -34,7 +31,7 @@ ProgressCallback = Callable[[int, int], None]
 
 
 class EditError(RuntimeError):
-    """Editing failed: configuration, adapter or sampling problem."""
+    """Editing failed: configuration, adapter or request problem."""
 
 
 @dataclass
@@ -66,13 +63,13 @@ class EditResult:
 
 
 class EditService:
-    """Owns the edit engine and turns HTTP requests into engine calls."""
+    """Editing on top of the text-to-image engine (same model, same VRAM)."""
 
-    def __init__(self, config, engine=None) -> None:
+    def __init__(self, config, engine) -> None:
+        if engine is None:
+            raise ValueError("EditService needs the shared MossEngine instance")
         self.config = config
-        self.t2i = engine
-        self._lock = threading.Lock()
-        self._engine: MossEditEngine | None = None
+        self.engine = engine
         self._error: str | None = None
 
     # ------------------------------------------------------------ readiness
@@ -99,77 +96,49 @@ class EditService:
         return True, ""
 
     @property
-    def engine(self) -> MossEditEngine | None:
-        return self._engine
-
-    @property
     def ready(self) -> bool:
-        return self._engine is not None and self._engine.ready
+        return self.engine.ready
 
     def idle_seconds(self) -> float:
-        return self._engine.idle_seconds() if self._engine is not None else 0.0
+        return self.engine.idle_seconds()
 
     def status(self) -> dict:
         available, reason = self.availability()
-        engine = self._engine
-        state = engine.state if engine is not None else "idle"
         info = {
             "available": available,
             "reason": reason or None,
-            "state": state,
+            "state": self.engine.state,
             "adapter": str(self.adapter) if self.adapter else None,
-            "lora": str(engine.fused_lora) if engine and engine.fused_lora else None,
+            "lora": str(self.engine.edit_lora) if self.engine.edit_lora else None,
             "backed_by": "ai-toolkit",
-            "load_seconds": round(engine.load_seconds, 2) if engine else 0.0,
+            "shared_model": True,
+            "mode": "edit" if self.engine.edit_mode else "text-to-image",
+            "load_seconds": round(self.engine.load_seconds, 2),
             "idle_seconds": round(self.idle_seconds(), 1),
-            "idle_unload_seconds": getattr(self.config, "edit_idle_unload_seconds", 0),
-            "error": (engine.error if engine else None) or self._error,
+            "idle_unload_seconds": getattr(self.config, "idle_unload_seconds", 0),
+            "error": (self.engine.error or None) or self._error,
             "max_ref_images": int(getattr(self.config, "edit_max_ref_images", 4)),
             "max_edge": int(getattr(self.config, "edit_max_edge", 1024)),
             "device": getattr(self.config, "device", "cuda"),
             "dtype": getattr(self.config, "dtype", "bf16"),
         }
-        if engine is not None and engine.ready:
-            described = engine.describe()
+        if self.engine.ready:
+            described = self.engine.describe()
             for key in ("vram_used_gib", "gpu_free", "gpu_total"):
                 if key in described:
                     info[key] = described[key]
         return info
 
     # ------------------------------------------------------------ lifecycle
-    def _ensure_engine(self) -> MossEditEngine:
-        with self._lock:
-            if self._engine is None:
-                self._engine = MossEditEngine(self.config)
-            return self._engine
-
-    def _free_t2i(self) -> None:
-        if self.t2i is None or not getattr(self.config, "edit_free_t2i", True):
-            return
-        try:
-            if self.t2i.ready:
-                LOGGER.info("Unloading the text-to-image engine to make room for editing")
-                self.t2i.unload("edit request")
-        except Exception:  # noqa: BLE001 - never block editing on this
-            LOGGER.exception("could not unload the text-to-image engine")
-
     def stop(self, reason: str = "") -> bool:
-        engine = self._engine
-        if engine is None:
-            return False
-        try:
-            return engine.unload(reason or "edit unload")
-        finally:
-            self._error = None
+        """Drop the shared model; editing and text-to-image go idle together."""
+        self._error = None
+        return self.engine.unload(reason or "edit unload")
 
     def maybe_idle_stop(self) -> bool:
-        idle = float(getattr(self.config, "edit_idle_unload_seconds", 0) or 0)
-        engine = self._engine
-        if engine is None or idle <= 0 or engine.state != "ready":
-            return False
-        if engine.idle_seconds() < idle:
-            return False
-        return engine.maybe_unload(idle)
+        # The shared model already has one idle timer (``idle_unload_seconds``);
+        # the API watchdog calls engine.maybe_unload for it.
+        return False
 
     # ------------------------------------------------------------- requests
     def edit(self, request: EditRequest) -> EditResult:
@@ -179,8 +148,6 @@ class EditService:
         if not request.images:
             raise EditError("at least one reference image is required")
 
-        self._free_t2i()
-        engine = self._ensure_engine()
         workdir = Path(tempfile.mkdtemp(prefix=f"moss-edit-{uuid.uuid4().hex[:8]}-"))
         try:
             paths = []
@@ -201,11 +168,11 @@ class EditService:
                 progress=request.progress,
             )
             try:
-                image = engine.edit(engine_request)
+                image = self.engine.edit(engine_request)
             except ValueError as error:
                 raise EditError(str(error)) from error
             self._error = None
-            holder = getattr(engine.engine, "holder", None)
+            holder = getattr(self.engine.engine, "holder", None)
             shift = float(getattr(holder, "sample_shift", request.shift or self.config.edit_shift))
             return EditResult(
                 image=image.image,

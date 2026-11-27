@@ -112,11 +112,6 @@ def create_app(config: Config) -> FastAPI:
                         LOGGER.info("Idle for %.0fs: model unloaded", idle)
                 except Exception:  # noqa: BLE001 - watchdog must survive
                     LOGGER.exception("idle unload failed")
-            try:
-                if await asyncio.to_thread(edit.maybe_idle_stop):
-                    LOGGER.info("Idle edit model unloaded")
-            except Exception:  # noqa: BLE001 - watchdog must survive
-                LOGGER.exception("idle edit-model unload failed")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -207,10 +202,8 @@ def create_app(config: Config) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
         await acquire_gpu()
         try:
-            # The edit model and the text-to-image model both want the card;
-            # give editing's VRAM back before the engine loads.
-            if getattr(config, "edit_free_t2i", True):
-                await asyncio.to_thread(edit.stop, "text-to-image request")
+            # Text-to-image and editing share one model, so there is nothing to
+            # unload here: the engine switches modes per request.
             started = time.perf_counter()
             # Loads the model on the first call, then generates.
             images = await asyncio.to_thread(engine.generate, request)

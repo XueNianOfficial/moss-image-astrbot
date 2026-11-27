@@ -63,10 +63,11 @@ python -m moss_server --config config.toml --port 8000
 
 ### 图像参考编辑（Moss-Image-Edit）
 
-改图与文生图共用同一个 ai-toolkit 引擎：ai-toolkit 的 MOSS 模型本身就有参考图分支
-（参考 token 走 t=0 调制、只与自身互相可见、K/V 跨步缓存），服务端只是额外挂一个编辑
-LoRA，并把参考图作为 `ctrl_img` 传进去。适配器第一次使用时会融合成 ai-toolkit 的
-`proj.qkv` 布局并缓存到 `output_dir/edit-lora/`。`edit_adapter` 留空即关闭改图。
+改图与文生图共用**同一个已加载的模型**：ai-toolkit 的 MOSS 模型本身就有参考图分支
+（参考 token 走 t=0 调制、只与自身互相可见、K/V 跨步缓存）。改图请求只是翻转 holder 上的
+`is_edit` / `kv_cache` / 视觉提示词编码三个开关、临时挂上编辑 LoRA，结束后翻回文生图状态，
+**不重载任何权重**。适配器第一次使用时会融合成 ai-toolkit 的 `proj.qkv` 布局并缓存到
+`output_dir/edit-lora/`。`edit_adapter` 留空即关闭改图。
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
@@ -77,14 +78,13 @@ LoRA，并把参考图作为 `ctrl_img` 传进去。适配器第一次使用时�
 | `edit_uncond_skip_layers` | `[]` | CFG 跳过层；编辑 LoRA 训练时未跳过 |
 | `edit_max_ref_images` | `4` | 参考图上限（1-8） |
 | `edit_max_edge` | `1024` | 参考图缩放后的长边 |
-| `edit_idle_unload_seconds` | `600` | 改图模型空闲多久卸载；`0` = 一直驻留 |
-| `edit_free_t2i` | `true` | 加载改图模型前先卸载文生图模型（反方向也成立） |
 | `edit_timeout` | `900` | 单次改图（含模型冷启动）的超时 |
 
-CLI：`--edit-adapter`、`--no-edit`、`--edit-uncond-skip-layers`、`--edit-idle-unload`、`--no-edit-free-t2i`。
+CLI：`--edit-adapter`、`--no-edit`、`--edit-uncond-skip-layers`。
+（`--edit-idle-unload` / `--no-edit-free-t2i` 已停用：只有一个模型、一个空闲计时器。）
 
-改图与文生图用同一套 convrot8 int8 量化，热态显存约 7-8 GiB；只有加载瞬间会短暂更高。
-显存紧张时把 `edit_max_edge` 降到 768，并保持 `edit_free_t2i = true`。
+改图与文生图是同一个模型，热态显存约 7 GiB（改图请求期间多占约 2-3 GiB 用于参考图
+latent 与 K/V，请求结束即释放）。显存紧张时把 `edit_max_edge` 降到 768。
 
 ### HTTP
 

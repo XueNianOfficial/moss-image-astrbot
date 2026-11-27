@@ -80,9 +80,10 @@ class Config:
     lora_dirs: list[str] = field(default_factory=list)
 
     # --- reference editing (Moss-Image-Edit) ------------------------------
-    # Editing runs on the same ai-toolkit engine as text-to-image; it only needs
-    # the edit LoRA adapter bundle.  The adapter is fused (q/k/v -> qkv) once at
-    # load time by moss_server.edit_lora, so no extra checkout is required.
+    # Editing runs on the *same* loaded model as text-to-image: ai-toolkit's
+    # MOSS transformer has the reference branch, so a request only switches the
+    # holder into edit mode and hooks the edit LoRA.  The adapter is fused
+    # (q/k/v -> qkv) once by moss_server.edit_lora; no extra checkout is needed.
     edit_enabled: bool = True
     edit_adapter: str = ""
     edit_steps: int = 20
@@ -92,10 +93,11 @@ class Config:
     edit_uncond_skip_layers: list[int] = field(default_factory=list)
     edit_max_ref_images: int = 4
     edit_max_edge: int = 1024
-    edit_idle_unload_seconds: int = 600
-    # Free the text-to-image model before the edit model takes the GPU.
-    edit_free_t2i: bool = True
     edit_timeout: float = 900.0
+    # Retired: editing no longer owns a second model, so there is nothing to
+    # unload separately.  Kept so old config files still parse.
+    edit_idle_unload_seconds: int = 0
+    edit_free_t2i: bool = False
 
     # --- HTTP -------------------------------------------------------------
     host: str = "127.0.0.1"
@@ -274,9 +276,9 @@ def build_parser() -> argparse.ArgumentParser:
                         dest="edit_uncond_skip_layers",
                         help="CFG skip blocks for editing (default: none)")
     parser.add_argument("--edit-idle-unload", type=int, default=None, dest="edit_idle_unload_seconds",
-                        help="seconds of inactivity before the edit model is unloaded (0 = never)")
+                        help=argparse.SUPPRESS)  # retired: one shared model, one idle timer
     parser.add_argument("--no-edit-free-t2i", dest="edit_free_t2i", action="store_false", default=None,
-                        help="keep the text-to-image model loaded while editing")
+                        help=argparse.SUPPRESS)  # retired: nothing to free, the model is shared
     return parser
 
 

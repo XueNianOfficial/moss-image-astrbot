@@ -69,9 +69,11 @@ lora_mode = "hook"
 lora_dirs = []
 
 # --- reference editing (Moss-Image-Edit) ----------------------------------
-# Editing runs on the *same* ai-toolkit engine as text-to-image: the reference
-# branch (clean latents at t=0, isolated reference K/V) is part of ai-toolkit's
-# MOSS model, so only the edit LoRA adapter is needed. Download it with:
+# Editing runs on the *same loaded model* as text-to-image: ai-toolkit's MOSS
+# transformer has the reference branch (clean latents at t=0, isolated reference
+# K/V), so a request only switches the model into edit mode and hooks the edit
+# LoRA. Nothing is reloaded when you alternate between drawing and editing.
+# Download the adapter with:
 #   hf download chinoll/Moss-Image-Edit --local-dir <dir>
 # The adapter is fused into ai-toolkit's qkv layout once, on first use.
 # Leave edit_adapter empty (or set edit_enabled = false) to disable editing.
@@ -84,10 +86,6 @@ edit_shift = 5.0
 edit_uncond_skip_layers = []
 edit_max_ref_images = 4
 edit_max_edge = 1024
-# Unload the edit model after this many idle seconds (frees its VRAM).
-edit_idle_unload_seconds = 600
-# Unload the text-to-image model before the edit model takes the card.
-edit_free_t2i = true
 edit_timeout = 900.0
 
 # --- HTTP -----------------------------------------------------------------

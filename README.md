@@ -48,8 +48,9 @@ AstrBot ──/draw───► 插件（skill 写提示词、Layout、LoRA 选�
 ```
 
 改图不是另一套模型：ai-toolkit 的 MOSS 实现本身就有参考图分支（参考 token 以 t=0
-调制、只与自身互相可见、K/V 可跨步缓存），所以服务端只是额外挂一个编辑 LoRA，并把参考图
-作为 `ctrl_img` 传进去。加载、量化、层卸载、懒加载、空闲卸载全部与文生图共用同一套代码。
+调制、只与自身互相可见、K/V 可跨步缓存）。服务端在**同一个已加载的模型**上翻转三个开关
+（`is_edit` / `kv_cache` / 视觉提示词编码）并临时挂上编辑 LoRA，请求结束再翻回来。
+所以「画图 → 改图 → 画图」全程**不重载权重**：模型只加载一次、只占一份显存。
 
 模型加载、量化、采样、LoRA 解析全部由 [ai-toolkit](https://github.com/ostris/ai-toolkit)
 的推理引擎完成——本仓库只做服务化、调度和插件，所以能跟着 ai-toolkit 一起升级。
@@ -177,8 +178,6 @@ curl -X POST http://127.0.0.1:8000/v1/moss/edit \
 | `edit_steps` / `edit_guidance_scale` | `20` / `4.0` | 改图默认采样参数 |
 | `edit_max_ref_images` / `edit_max_edge` | `4` / `1024` | 参考图数量与长边上限 |
 | `edit_uncond_skip_layers` | `[]` | 改图的 CFG 跳过层（编辑 LoRA 训练时未跳过） |
-| `edit_idle_unload_seconds` | `600` | 改图模型空闲多久卸载并释放显存 |
-| `edit_free_t2i` | `true` | 启动改图前先卸载文生图引擎 |
 
 插件配置（WebUI 里可直接改）：负面提示词、步数、CFG、shift、CFG 跳过层、LoRA 目录文本、
 prompt skill 路径与章节、改图开关、冷却与权限等。LoRA 目录每行一条：
@@ -246,7 +245,8 @@ prompt skill 路径与章节、改图开关、冷却与权限等。LoRA 目录�
 | 模型加载 | ~20 s（懒加载，首次请求） |
 | 空闲卸载后显存 | 2.7 GiB |
 | 改图模型加载 | ~21 s（与文生图同一套 convrot8 量化） |
-| 改图 1024² / 12 步（热） | **13 s** |
+| 改图 1024² / 12 步（热，与文生图共用模型） | **13-15 s** |
+| 文生图 ↔ 改图切换 | **0 s**（不重载权重） |
 
 ## LoRA
 
@@ -264,9 +264,9 @@ curl -X POST http://127.0.0.1:8000/v1/loras/load -H "Content-Type: application/j
 
 ```
 moss_server/        推理服务（FastAPI + 引擎封装 + LoRA 注册表 + 改图 + 校验）
-  edit.py           改图服务：请求编排、参考图落盘、空闲卸载、与文生图互斥
+  edit.py           改图服务：请求编排、参考图落盘、状态上报（模型与文生图共用）
   edit_lora.py      把 Moss-Image-Edit 适配器融合成 ai-toolkit 的 qkv 布局（带缓存）
-  engine.py         MossEngine（文生图）与 MossEditEngine（参考图编辑）
+  engine.py         MossEngine：文生图与参考图编辑共用一个加载好的模型
 plugin/             AstrBot 插件（命令、两个 LLM 工具、prompt skill 加载、LoRA 目录）
 scripts/            冒烟测试、压测、画质检查
 tests/              单元测试 + 插件集成测试（无需 GPU 的部分可直接跑）

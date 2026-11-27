@@ -19,6 +19,7 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from moss_server.config import load_config  # noqa: E402
+from moss_server.engine import MossEngine  # noqa: E402
 from moss_server.edit import EditError, EditService  # noqa: E402
 from moss_server.edit_lora import (  # noqa: E402
     AdapterError,
@@ -222,7 +223,7 @@ def test_bad_adapter_is_reported():
 def test_service_unavailable_without_adapter():
     config = load_config(None, None)
     config.edit_adapter = ""
-    service = EditService(config)
+    service = EditService(config, engine=MossEngine(config))
     available, reason = service.availability()
     assert not available and "edit_adapter" in reason
     assert service.status()["state"] == "idle"
@@ -239,21 +240,51 @@ def test_service_availability_and_idle_stop():
     config = load_config(None, None)
     config.output_dir = str(root / "out")
     config.edit_adapter = str(adapter)
-    service = EditService(config)
+    service = EditService(config, engine=MossEngine(config))
     available, reason = service.availability()
     assert available, reason
     status = service.status()
     assert status["available"] and status["state"] == "idle" and status["backed_by"] == "ai-toolkit"
+    assert status["shared_model"] is True and status["mode"] == "text-to-image"
     assert service.maybe_idle_stop() is False
     assert service.stop() is False
-    print("  availability + idle-stop no-op verified")
+    print("  availability + shared-model status verified")
+
+
+def test_engine_edit_mode_flags():
+    """The engine flips the holder's edit switches; no reload is involved."""
+    config = load_config(None, None)
+    engine = MossEngine(config)
+
+    class Holder:
+        is_edit = False
+        kv_cache = False
+        encode_control_in_text_embeddings = True
+        sample_shift = 5.0
+        uncond_skip_layers = (22,)
+
+        class model_config:
+            model_kwargs = {}
+
+    holder = Holder()
+    engine.engine = type("Stub", (), {"holder": holder})()
+    engine.set_edit_mode(True)
+    assert holder.is_edit is True and holder.kv_cache is True
+    assert holder.encode_control_in_text_embeddings is False
+    assert holder.model_config.model_kwargs["control_image_max_pixels"] == 1024 * 1024
+    engine.set_edit_mode(False)
+    assert holder.is_edit is False and holder.kv_cache is False
+    assert holder.sample_shift == config.default_shift
+    assert holder.uncond_skip_layers == tuple(config.default_uncond_skip_layers)
+    print("  edit-mode flags toggle in place, T2I defaults restored")
 
 
 def test_config_edit_fields():
     config = load_config(None, None)
     assert config.edit_enabled is True and config.edit_steps == 20
     assert config.edit_uncond_skip_layers == []
-    assert config.edit_free_t2i is True
+    assert config.idle_unload_seconds > 0
+    assert config.edit_idle_unload_seconds == 0  # retired: one shared model
 
     root = Path(tempfile.mkdtemp(prefix="moss-edit-cfg-"))
     (root / "ai-toolkit" / "toolkit").mkdir(parents=True)
