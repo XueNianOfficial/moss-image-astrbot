@@ -264,6 +264,7 @@ class MossClient:
         seed: int | None = None,
         shift: float | None = None,
         max_edge: int | None = None,
+        loras: dict[str, float] | None = None,
         timeout: float | None = None,
     ) -> EditOutcome:
         """Edit reference image(s) with an instruction (Moss-Image-Edit)."""
@@ -275,6 +276,8 @@ class MossClient:
             "negative_prompt": negative_prompt or "",
             "response_format": "b64_json",
         }
+        if loras:
+            payload["loras"] = {str(name): float(weight) for name, weight in loras.items()}
         if size:
             payload["size"] = size
         if width:

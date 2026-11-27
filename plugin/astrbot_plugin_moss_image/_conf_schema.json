@@ -209,7 +209,7 @@
   "edit": {
     "description": "图像参考编辑（Moss-Image-Edit）",
     "type": "object",
-    "hint": "让 bot 按文字指令修改图片（换背景/换装/换光线）。需要服务端配置好 edit_adapter（编辑 LoRA），与文生图共用同一引擎。",
+    "hint": "让 bot 按文字指令修改图片（换背景/换装/换光线），支持 1 张到多张参考图。需要服务端配置好 edit_adapter（编辑 LoRA），与文生图共用同一个已加载的模型。",
     "items": {
       "enabled": {
         "description": "启用 /edit 与 moss_edit_image",
@@ -226,7 +226,137 @@
           "max": 8,
           "step": 1
         },
-        "hint": "多图编辑时按顺序传入，指令里要说明每张的用途"
+        "hint": "bot 用 images 参数按编号选择，例如 “1,2”；编号先数本条消息的图片，再数引用消息里的图片"
+      }
+    }
+  },
+  "edit_skill": {
+    "description": "图像编辑 Skill（随插件提供）",
+    "type": "object",
+    "hint": "改图的写法规范：怎么选参考图、怎么分配多图角色、指令怎么写、参数怎么给、失败了怎么修。文件在仓库 skills/moss-image-edit/SKILL.md（MIT），安装脚本会复制到 AstrBot 的 skills 目录。",
+    "items": {
+      "enabled": {
+        "description": "启用改图 skill",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后不再提示模型先读规范，改图仍可用"
+      },
+      "path": {
+        "description": "SKILL.md 路径",
+        "type": "string",
+        "default": "",
+        "hint": "留空自动查找 <AstrBot数据目录>/skills/moss-image-edit-skill/SKILL.md；也可填文件或目录",
+        "obvious_hint": true
+      },
+      "sections": {
+        "description": "参与改写的章节",
+        "type": "string",
+        "default": "0,1,2,3,4,10",
+        "hint": "只在 /edit --enhance 与工具 enhance=true 时按章节拼系统提示；0=决策流程 1=能力边界 2=参考图选择 3=指令写法 4=多图合成 10=输出契约"
+      },
+      "max_chars": {
+        "description": "章节文本上限（字符）",
+        "type": "int",
+        "default": 0,
+        "slider": {
+          "min": 0,
+          "max": 40000,
+          "step": 1000
+        },
+        "hint": "0 = 不截断"
+      },
+      "guidance": {
+        "description": "注入「先读改图规范」提示",
+        "type": "bool",
+        "default": true,
+        "hint": "在系统提示里要求模型改图前先读该文件的相关章节，而不是整篇灌入"
+      }
+    }
+  },
+  "edit_lora": {
+    "description": "改图 LoRA（与编辑 LoRA 叠加）",
+    "type": "object",
+    "hint": "这里配置的 LoRA 只在改图时叠加，与「LoRA 目录」是两份独立清单。默认启用的条目会自动带上，适合放“基础风格/画质增强”类 LoRA，权重建议 0.2-0.5，太高会盖掉参考图。",
+    "items": {
+      "enabled": {
+        "description": "改图时叠加 LoRA",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后改图只使用服务端的编辑 LoRA"
+      },
+      "allow_bot_choice": {
+        "description": "允许 AI 为改图追加 LoRA",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后把下面条目的描述注入系统提示，LLM 可在 moss_edit_image 的 lora 参数里额外指定"
+      },
+      "max_weight": {
+        "description": "改图时可设置的最大权重",
+        "type": "float",
+        "default": 1.0,
+        "slider": {
+          "min": 0.1,
+          "max": 2.0,
+          "step": 0.1
+        },
+        "hint": "改图以贴合参考图优先，一般不超过 0.6"
+      },
+      "lora_items": {
+        "description": "改图 LoRA 列表",
+        "type": "template_list",
+        "default": [],
+        "hint": "添加条目后逐项填写；「默认启用」的条目每次改图都会自动叠加",
+        "templates": {
+          "lora": {
+            "name": "LoRA",
+            "display_item": "name",
+            "hint": "一条只用于改图的 LoRA",
+            "items": {
+              "name": {
+                "description": "名称",
+                "type": "string",
+                "default": ""
+              },
+              "path": {
+                "description": "文件路径",
+                "type": "string",
+                "default": ""
+              },
+              "enabled": {
+                "description": "默认启用",
+                "type": "bool",
+                "default": true
+              },
+              "weight": {
+                "description": "默认权重",
+                "type": "float",
+                "default": 0.4,
+                "slider": {
+                  "min": 0.0,
+                  "max": 1.5,
+                  "step": 0.05
+                }
+              },
+              "description": {
+                "description": "描述（给 AI 判断什么时候用）",
+                "type": "text",
+                "default": ""
+              },
+              "trigger_words": {
+                "description": "触发词",
+                "type": "string",
+                "default": ""
+              }
+            }
+          }
+        }
+      },
+      "catalog_lines": {
+        "description": "改图 LoRA 文本列表（兼容）",
+        "type": "string",
+        "default": "",
+        "hint": "填写后优先于上面的列表。格式同绘图：名称 | 路径 | on/off | 权重 | 描述 | 触发词，多条用分号分隔",
+        "obvious_hint": false
       }
     }
   },
@@ -255,9 +385,9 @@
     }
   },
   "lora": {
-    "description": "LoRA 目录",
+    "description": "LoRA 目录（绘图）",
     "type": "object",
-    "hint": "每行一条 LoRA：名称 | 文件路径 | 是否默认启用 | 权重 | 描述 | 触发词。插件启动时把它们注册到服务端；AI 会读描述自动决定用不用、用多重。",
+    "hint": "每条 LoRA 有名称、路径、是否默认启用、权重、描述与触发词。插件启动时把它们注册到服务端；AI 会读描述自动决定用不用、用多重。改图另有一份独立清单，见「改图 LoRA」。",
     "items": {
       "enabled": {
         "description": "启用 LoRA 功能",
@@ -282,12 +412,67 @@
         },
         "hint": "超过 1.0 容易过拟合风格；仅在需要强化特征时调高"
       },
-      "catalog_lines": {
+      "lora_items": {
         "description": "LoRA 列表",
+        "type": "template_list",
+        "default": [],
+        "hint": "点「添加条目」逐项填写：名称、文件路径、默认启用、权重、描述、触发词。描述越具体，AI 越知道什么时候该用",
+        "templates": {
+          "lora": {
+            "name": "LoRA",
+            "display_item": "name",
+            "hint": "一条 LoRA",
+            "items": {
+              "name": {
+                "description": "名称",
+                "type": "string",
+                "default": "",
+                "hint": "命令里用这个名字引用，例如 --lora kemono:0.8"
+              },
+              "path": {
+                "description": "文件路径",
+                "type": "string",
+                "default": "",
+                "hint": "服务端能访问到的 .safetensors 路径"
+              },
+              "enabled": {
+                "description": "默认启用",
+                "type": "bool",
+                "default": false,
+                "hint": "开启后每次出图都会带上这条 LoRA"
+              },
+              "weight": {
+                "description": "默认权重",
+                "type": "float",
+                "default": 0.7,
+                "slider": {
+                  "min": 0.0,
+                  "max": 1.5,
+                  "step": 0.05
+                }
+              },
+              "description": {
+                "description": "描述（给 AI 判断什么时候用）",
+                "type": "text",
+                "default": "",
+                "hint": "写清风格/角色特征与适用场景，AI 靠它决定是否启用"
+              },
+              "trigger_words": {
+                "description": "触发词",
+                "type": "string",
+                "default": "",
+                "hint": "启用该 LoRA 时自动追加到提示词末尾，多个用逗号"
+              }
+            }
+          }
+        }
+      },
+      "catalog_lines": {
+        "description": "LoRA 文本列表（兼容/批量）",
         "type": "string",
         "default": "",
-        "hint": "格式：名称 | 文件路径 | on/off | 权重 | 描述 | 触发词；多条用分号 ; 分隔，# 开头为注释。描述越具体，AI 越知道什么时候该用",
-        "obvious_hint": true
+        "hint": "填写后优先于上面的列表。格式：名称 | 文件路径 | on/off | 权重 | 描述 | 触发词；多条用分号 ; 分隔，# 开头为注释",
+        "obvious_hint": false
       }
     }
   },

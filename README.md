@@ -11,8 +11,13 @@
 - **不合并权重**：LoRA 通过 forward hook 动态挂载，换 LoRA / 改强度不重载模型
 - **空闲自动卸载**：默认 10 分钟没有请求就把显存还回去，下个请求再懒加载
 - **图像参考编辑**：同一个 ai-toolkit 引擎加载 [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit)
-  的编辑 LoRA，按文字指令换背景 / 换装 / 换光线，支持 1-4 张参考图；参考图以干净 latent 进入，
-  K/V 缓存跨采样步复用
+  的编辑 LoRA，按文字指令换背景 / 换装 / 换光线；**支持 1-4 张参考图**，bot 可用编号（`images="1,2"`）
+  指定用哪几张、各自当什么角色；参考图以干净 latent 进入，K/V 缓存跨采样步复用
+- **改图专用 skill**：随仓库提供 `skills/moss-image-edit/SKILL.md`（MIT），教模型怎么选参考图、
+  写编辑指令、配参数、修失败；和提示词 skill 一样是「运行时读文件」，规则不写死在插件里
+- **两份 LoRA 清单**：绘图 LoRA 与改图 LoRA 各自独立配置，改图默认叠加哪些 LoRA 单独设置
+- **可视化配置**：LoRA 列表在 WebUI 里是一条条可编辑的条目（名称/路径/默认启用/权重/描述/触发词），
+  不用再手写竖线分隔的文本
 - **提示词交给独立 skill**：[moss-image-prompt-skill](https://github.com/Moeblack/moss-image-prompt-skill)
   运行时从磁盘读取，插件不内置任何提示词规则（也不打包其内容）
 - **Layout Enhancer**：海报/带文字排版，LLM 只写草稿框，坐标换算走官方 `compile_prompt`
@@ -149,6 +154,7 @@ curl -X POST http://127.0.0.1:8000/v1/moss/edit \
 ```
 /draw 雨夜的霓虹街道，一只白狐回头 --size 1024x1536 --steps 30
 /edit 把背景换成晴天的海边，保留人物        # 图片和指令一起发，或引用一张图
+/edit 把第 2 张的外套穿到第 1 张身上 --ref 1,2   # 多参考图合成
 /loras              # 查看 LoRA 目录
 /drawstatus         # 服务状态、模型、显存、skill、改图状态
 ```
@@ -175,6 +181,7 @@ curl -X POST http://127.0.0.1:8000/v1/moss/edit \
 | `loras` | `[]` | 启动时注册的 LoRA（插件会自己注册，通常留空） |
 | `lora_mode` | `hook` | `hook`=动态挂载，`merge`=写入权重 |
 | `edit_adapter` | `""` | 编辑 LoRA 目录（`adapter_config.json` + `adapter_model.safetensors`） |
+| `edit_loras` | `{}` | 改图默认叠加的已注册 LoRA：`{名称 = 权重}`（插件通常按请求自带） |
 | `edit_steps` / `edit_guidance_scale` | `20` / `4.0` | 改图默认采样参数 |
 | `edit_max_ref_images` / `edit_max_edge` | `4` / `1024` | 参考图数量与长边上限 |
 | `edit_uncond_skip_layers` | `[]` | 改图的 CFG 跳过层（编辑 LoRA 训练时未跳过） |
@@ -185,6 +192,9 @@ prompt skill 路径与章节、改图开关、冷却与权限等。LoRA 目录�
 ```
 名称 | 文件路径 | on/off | 权重 | 描述 | 触发词
 ```
+
+WebUI 里也可以直接用「LoRA 列表」（可视化条目编辑器）逐条填写；改图另有一份独立的
+「改图 LoRA 列表」，其中「默认启用」的条目只在改图请求里叠加。
 
 ## HTTP API
 
@@ -231,6 +241,7 @@ prompt skill 路径与章节、改图开关、冷却与权限等。LoRA 目录�
   "shift": 5.0,
   "seed": 7,
   "max_edge": 1024,           // 参考图缩放长边
+  "loras": {"kemono": 0.5},   // 可选：编辑 LoRA 之上再叠一份已注册的 LoRA
   "use_kv_cache": true,       // 参考图 KV 缓存（默认开）
   "response_format": "url"
 }
@@ -279,6 +290,7 @@ config.example.toml 配置模板
 ```bash
 python tests/test_schemas.py          # 请求/配置校验（无需 GPU）
 python tests/test_lora.py             # LoRA 注册表 + 头扫描
+skills/moss-image-edit/SKILL.md       # 改图 skill（MIT，随仓库分发）
 python tests/test_edit.py             # 改图请求、适配器融合、生命周期（无需 GPU）
 python tests/test_prompt_skill.py     # skill 解析与输出契约（MOSS_TEST_SKILL=<SKILL.md>）
 python tests/test_plugin_helpers.py   # 插件纯函数（解析、提示词、布局）

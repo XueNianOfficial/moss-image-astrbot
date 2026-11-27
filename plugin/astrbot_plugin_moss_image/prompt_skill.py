@@ -31,6 +31,15 @@ DEFAULT_SKILL_PATHS = (
     "~/.astrbot/data/skills/moss-image-prompt-skill/skill.md",
 )
 
+#: The editing skill ships with this plugin (MIT, see skills/moss-image-edit).
+#: install.ps1 / install.sh copy it next to the prompt skill; the repo checkout
+#: is also searched so a dev tree works without installing.
+EDIT_SKILL_PATHS = (
+    "~/.astrbot/data/skills/moss-image-edit-skill/SKILL.md",
+    "~/.astrbot/data/skills/moss-image-edit-skill/skill.md",
+    "~/.astrbot/data/skills/moss-image-edit/SKILL.md",
+)
+
 SKILL_REPO = "https://github.com/Moeblack/moss-image-prompt-skill"
 
 _SECTION_RE = re.compile(r"^##\s+(\d+)\.\s*(.+?)\s*$", re.MULTILINE)
@@ -63,10 +72,20 @@ class SkillInfo:
 class PromptSkill:
     """Resolve, cache and slice the on-disk skill file."""
 
-    def __init__(self, path: str = "", *, sections: str = DEFAULT_SECTIONS, max_chars: int = 0):
+    def __init__(
+        self,
+        path: str = "",
+        *,
+        sections: str = DEFAULT_SECTIONS,
+        max_chars: int = 0,
+        default_paths: tuple[str, ...] | None = None,
+        name: str = "moss-image-prompt-skill",
+    ):
         self.configured_path = (path or "").strip()
         self.sections = [int(part) for part in re.findall(r"\d+", sections or "")]
         self.max_chars = max(0, int(max_chars or 0))
+        self.default_paths = tuple(default_paths) if default_paths else DEFAULT_SKILL_PATHS
+        self.default_name = name
         self._cache: str | None = None
         self._info: SkillInfo | None = None
 
@@ -76,7 +95,7 @@ class PromptSkill:
         configured = self.configured_path
         if configured:
             candidates.append(_expand(configured))
-        candidates.extend(_expand(item) for item in DEFAULT_SKILL_PATHS)
+        candidates.extend(_expand(item) for item in self.default_paths)
         for candidate in candidates:
             if candidate.is_dir():
                 for name in ("SKILL.md", "skill.md"):
@@ -111,7 +130,9 @@ class PromptSkill:
             return self._info
         path = self.path
         text = self.text()
-        info = SkillInfo(path=str(path) if path else None, chars=len(text))
+        info = SkillInfo(
+            path=str(path) if path else None, chars=len(text), name=self.default_name
+        )
         if text:
             front = _FRONTMATTER_RE.match(text)
             if front:
@@ -165,6 +186,20 @@ class PromptSkill:
             "先看它的 §0 与目录判断模式，再只读命中的章节，不要整篇灌入；"
             "按其中的「模式判断 → booru tag 清洗 → 分块语序 → 正负模板 → 自检清单」流程写好提示词，"
             "再带着提示词调用工具。禁止跳过该文件凭直觉写提示词；确实无法读取时须简短说明原因。"
+        )
+
+    def edit_guide(self) -> str:
+        """Instruction telling the model to consult this file before editing."""
+        path = self.path
+        if path is None:
+            return ""
+        return (
+            "【图像编辑规范（必读）】只要本轮要改图（调用 moss_edit_image 或 /edit），"
+            "必须先读取图像编辑规范：\n"
+            f"{path}\n"
+            "先读 §0 决策流程与目录，再只读相关章节（参考图选择、指令写法、多图合成、参数、失败修复），"
+            "不要整篇灌入。写指令前先确定「改什么 / 保留什么」，并决定用哪几张参考图、各自承担什么角色；"
+            "改完在回复里说明改了哪些地方。确实无法读取时须简短说明原因。"
         )
 
 

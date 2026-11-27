@@ -112,6 +112,11 @@ class MossEditRequest(BaseModel):
     shift: float | None = Field(None, ge=1.0, le=20.0)
     max_edge: int | None = Field(None, ge=16, le=2048,
                                  description="Longest edge the reference image is resized to")
+    loras: dict[str, float] | None = Field(
+        None,
+        description="Extra LoRAs stacked on top of the edit LoRA: {name: weight}. "
+                    "Names must be registered with POST /v1/loras/load.",
+    )
     #: Kept for compatibility: the reference KV cache is always used now.
     use_kv_cache: bool = True
     response_format: Literal["url", "b64_json"] = "url"
@@ -297,6 +302,7 @@ def build_edit_request(
         seed=body.seed,
         shift=body.shift if body.shift is not None else default_shift,
         max_edge=body.max_edge or default_max_edge,
+        loras=body.loras,
         progress=progress,
     )
     return request, width, height

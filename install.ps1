@@ -281,6 +281,17 @@ if ($SkipSkill) {
     }
 }
 
+# The editing skill ships with this repo (MIT), so it is copied rather than cloned.
+$editSkillSource = Join-Path $Root "skills\moss-image-edit\SKILL.md"
+if (Test-Path $editSkillSource) {
+    $editSkillDir = Join-Path (Split-Path $SkillDir -Parent) "moss-image-edit-skill"
+    New-Item -ItemType Directory -Force -Path $editSkillDir | Out-Null
+    Copy-Item $editSkillSource (Join-Path $editSkillDir "SKILL.md") -Force
+    Write-Ok "edit skill: $editSkillDir\SKILL.md"
+} else {
+    Write-Warn "edit skill not found in the repo (skills\moss-image-edit\SKILL.md)"
+}
+
 # ---------------------------------------------------------------- 6. config
 Write-Step 6 8 "Writing config.toml"
 $configPath = Join-Path $Root "config.toml"

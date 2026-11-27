@@ -79,12 +79,18 @@ python -m moss_server --config config.toml --port 8000
 | `edit_max_ref_images` | `4` | 参考图上限（1-8） |
 | `edit_max_edge` | `1024` | 参考图缩放后的长边 |
 | `edit_timeout` | `900` | 单次改图（含模型冷启动）的超时 |
+| `edit_loras` | `{}` | 改图默认叠加的已注册 LoRA，`{名称 = 权重}`；插件一般按请求自带 |
 
 CLI：`--edit-adapter`、`--no-edit`、`--edit-uncond-skip-layers`。
 （`--edit-idle-unload` / `--no-edit-free-t2i` 已停用：只有一个模型、一个空闲计时器。）
 
 改图与文生图是同一个模型，热态显存约 7 GiB（改图请求期间多占约 2-3 GiB 用于参考图
 latent 与 K/V，请求结束即释放）。显存紧张时把 `edit_max_edge` 降到 768。
+
+改图默认只挂编辑 LoRA。要让风格 LoRA 也参与改图，两种方式：
+
+- 请求里带 `"loras": {"kemono": 0.4}`（插件会按「改图 LoRA」清单自动带）
+- 或在服务端配置 `[server.edit_loras]`，让所有改图请求默认叠加
 
 ### HTTP
 

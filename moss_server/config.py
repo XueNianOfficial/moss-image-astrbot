@@ -94,6 +94,10 @@ class Config:
     edit_max_ref_images: int = 4
     edit_max_edge: int = 1024
     edit_timeout: float = 900.0
+    #: Registered LoRAs stacked with the edit LoRA by default: {name: weight}.
+    #: The plugin normally sends its own per-request list instead; this is the
+    #: fallback for direct API callers.
+    edit_loras: dict[str, float] = field(default_factory=dict)
     # Retired: editing no longer owns a second model, so there is nothing to
     # unload separately.  Kept so old config files still parse.
     edit_idle_unload_seconds: int = 0

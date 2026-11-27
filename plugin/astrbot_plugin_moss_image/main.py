@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+from pathlib import Path
 import time
 from dataclasses import dataclass
 
@@ -43,12 +44,12 @@ from .moss_client import (
     MossTimeoutError,
 )
 from .prompt_parser import DrawRequest, parse_draw_request, parse_size
-from .prompt_skill import PromptSkill, SkillPrompter, clean_caption
+from .prompt_skill import EDIT_SKILL_PATHS, PromptSkill, SkillPrompter, clean_caption
 
 TOOL_NAME = "moss_draw_image"
 EDIT_TOOL_NAME = "moss_edit_image"
 #: Bumped when the handler contract changes; shows up in the load log.
-PLUGIN_BUILD = "4-retry-register"
+PLUGIN_BUILD = "5-edit-multiref"
 
 _COMMAND_RE = re.compile(
     r"^[/!#]?\s*(draw|moss|绘图|画图|画画|生图)\b\s*[:：]?\s*", re.IGNORECASE
@@ -59,6 +60,19 @@ _PREFIX_RE = re.compile(
     r"[:：,，]?\s*",
     re.IGNORECASE,
 )
+
+#: ``--ref 1,2`` / ``--refs 1`` / ``--图片 1,2`` selects which references to use.
+_REF_RE = re.compile(r"(?:^|\s)--?(?:refs?|图片|参考图)\s+(\S+)", re.IGNORECASE)
+
+
+def _split_ref_argument(text: str) -> tuple[str, str]:
+    """Pull ``--ref <selector>`` out of a command body; returns (selector, rest)."""
+    match = _REF_RE.search(text or "")
+    if not match:
+        return "", text or ""
+    selector = match.group(1).strip()
+    rest = (text[: match.start()] + " " + text[match.end() :]).strip()
+    return selector, rest
 
 
 @dataclass
@@ -86,6 +100,19 @@ class Settings:
     skill_timeout: float = 150.0
     edit_enabled: bool = True
     edit_max_images: int = 4
+    # Editing has its own skill (bundled with this plugin, MIT): it teaches the
+    # model how to pick references and write edit instructions.
+    edit_skill_enabled: bool = True
+    edit_skill_path: str = ""
+    edit_skill_sections: str = "0,1,2,3,4,10"
+    edit_skill_max_chars: int = 0
+    edit_skill_guidance: bool = True
+    # LoRAs stacked with the edit LoRA. A separate catalog: what makes sense for
+    # editing (a base-style LoRA at low weight) is not what a draw call wants.
+    edit_lora_enabled: bool = True
+    edit_lora_allow_bot_choice: bool = True
+    edit_lora_max_weight: float = 1.0
+    edit_lora_catalog_raw: object = None
     layout_enabled: bool = True
     layout_retries: int = 2
     lora_enabled: bool = True
@@ -166,13 +193,32 @@ def parse_settings(config) -> Settings:
     settings.skill_timeout = max(30.0, float(skill.get("timeout") or settings.skill_timeout))
     settings.edit_enabled = _bool(edit, "enabled", settings.edit_enabled)
     settings.edit_max_images = max(1, min(8, int(edit.get("max_images") or settings.edit_max_images)))
+    edit_skill = _section(config, "edit_skill")
+    settings.edit_skill_enabled = _bool(edit_skill, "enabled", settings.edit_skill_enabled)
+    settings.edit_skill_path = str(edit_skill.get("path") or "").strip()
+    settings.edit_skill_sections = str(
+        edit_skill.get("sections") or settings.edit_skill_sections
+    ).strip()
+    settings.edit_skill_max_chars = max(0, int(edit_skill.get("max_chars") or 0))
+    settings.edit_skill_guidance = _bool(edit_skill, "guidance", settings.edit_skill_guidance)
+    edit_lora = _section(config, "edit_lora")
+    settings.edit_lora_enabled = _bool(edit_lora, "enabled", settings.edit_lora_enabled)
+    settings.edit_lora_allow_bot_choice = _bool(
+        edit_lora, "allow_bot_choice", settings.edit_lora_allow_bot_choice
+    )
+    settings.edit_lora_max_weight = max(
+        0.1, min(2.0, float(edit_lora.get("max_weight") or settings.edit_lora_max_weight))
+    )
+    settings.edit_lora_catalog_raw = (
+        edit_lora.get("lora_items") or edit_lora.get("catalog_lines") or edit_lora.get("catalog")
+    )
     settings.layout_enabled = _bool(layout, "enabled", settings.layout_enabled)
     settings.layout_retries = int(layout.get("max_retries") or settings.layout_retries)
     settings.lora_enabled = _bool(lora, "enabled", settings.lora_enabled)
     settings.lora_allow_bot_choice = _bool(lora, "allow_bot_choice", settings.lora_allow_bot_choice)
     settings.lora_max_weight = max(0.1, min(2.0, float(lora.get("max_weight") or settings.lora_max_weight)))
     settings.lora_catalog_raw = (
-        lora.get("catalog_lines") or lora.get("catalog")
+        lora.get("lora_items") or lora.get("catalog_lines") or lora.get("catalog")
     )
     settings.admin_only = _bool(behaviour, "admin_only", settings.admin_only)
     settings.cooldown = float(behaviour.get("cooldown") or settings.cooldown)
@@ -219,6 +265,22 @@ class MossImagePlugin(Star):
             max_weight=self.settings.lora_max_weight,
             allow_bot_choice=self.settings.lora_allow_bot_choice,
         )
+        edit_entries = parse_catalog(self.settings.edit_lora_catalog_raw)
+        if not self.settings.edit_lora_enabled:
+            for entry in edit_entries:
+                entry.enabled = False
+        self.edit_catalog = LoRACatalog(
+            edit_entries,
+            max_weight=self.settings.edit_lora_max_weight,
+            allow_bot_choice=self.settings.edit_lora_allow_bot_choice,
+        )
+        self.edit_skill = PromptSkill(
+            self.settings.edit_skill_path if self.settings.edit_skill_enabled else "",
+            sections=self.settings.edit_skill_sections,
+            max_chars=self.settings.edit_skill_max_chars,
+            default_paths=EDIT_SKILL_PATHS,
+            name="moss-image-edit-skill",
+        )
         self._last_request: dict[str, float] = {}
         self._retry_task: asyncio.Task | None = None
 
@@ -247,6 +309,21 @@ class MossImagePlugin(Star):
                 "[moss_image] 未找到提示词 skill（moss-image-prompt-skill），"
                 "只会按用户原文出图；把 SKILL.md 放到 AstrBot 的 skills 目录或在配置里填写路径"
             )
+        edit_info = self.edit_skill.info()
+        if edit_info.available:
+            logger.info(
+                f"[moss_image] 改图 skill: {edit_info.name} v{edit_info.version} "
+                f"({edit_info.license}) {edit_info.chars} 字符 -> {edit_info.path}"
+            )
+        elif self.settings.edit_skill_enabled:
+            logger.warning(
+                "[moss_image] 未找到改图 skill（skills/moss-image-edit/SKILL.md），"
+                "改图仍可用，但模型不会拿到参考图与指令的写法规范"
+            )
+        logger.info(
+            f"[moss_image] LoRA 目录：绘图 {len(self.catalog.entries)} 条，"
+            f"改图 {len(self.edit_catalog.entries)} 条"
+        )
         await self._register_catalog()
         if self._needs_registration():
             # AstrBot can start before the MOSS server (cold boot, autostart race),
@@ -254,10 +331,16 @@ class MossImagePlugin(Star):
             # without the catalog LoRAs.
             self._retry_task = asyncio.create_task(self._registration_retry())
 
+    def _catalogs(self) -> list:
+        """Both catalogs: draw mode and edit mode have separate LoRA sets."""
+        return [self.catalog, self.edit_catalog]
+
     def _needs_registration(self) -> bool:
         return any(
-            entry.enabled and not entry.registered for entry in self.catalog.entries
-        ) and self.settings.lora_enabled
+            entry.enabled and not entry.registered
+            for catalog in self._catalogs()
+            for entry in catalog.entries
+        ) and (self.settings.lora_enabled or self.settings.edit_lora_enabled)
 
     async def _registration_retry(self, attempts: int = 20, interval: float = 20.0) -> None:
         """Wait for the server and register the catalog, then stop."""
@@ -279,18 +362,35 @@ class MossImagePlugin(Star):
         logger.warning("[moss_image] LoRA 目录仍未能注册，请检查服务端是否运行")
 
     async def _register_catalog(self) -> None:
-        """Declare every catalog LoRA to the server (registry only, no model load)."""
-        for entry in self.catalog.entries:
-            try:
-                await self.client.load_lora(entry.name, entry.path, scale=entry.weight, replace=True)
-                entry.registered = True
-            except MossError as error:
-                entry.registered = False
-                logger.warning(f"[moss_image] LoRA {entry.name} 注册失败: {error.user_message()}")
-        names = [entry.name for entry in self.catalog.registered()]
-        logger.info(
-            f"[moss_image] LoRA 目录 {len(self.catalog.entries)} 条，已注册: {names or '无'}"
-        )
+        """Declare every catalog LoRA to the server (registry only, no model load).
+
+        Both catalogs are registered: the draw list and the edit list are
+        separate, but they share the server-side registry, so an entry used for
+        editing must be registered even when it is not in the draw list (and
+        vice versa). Duplicates by name are registered once.
+        """
+        done: dict[str, bool] = {}
+        for catalog in self._catalogs():
+            for entry in catalog.entries:
+                if entry.name in done:
+                    entry.registered = done[entry.name]
+                    continue
+                try:
+                    await self.client.load_lora(
+                        entry.name, entry.path, scale=entry.weight, replace=True
+                    )
+                    entry.registered = True
+                except MossError as error:
+                    entry.registered = False
+                    logger.warning(f"[moss_image] LoRA {entry.name} 注册失败: {error.user_message()}")
+                done[entry.name] = entry.registered
+        for label, catalog in (("绘图", self.catalog), ("改图", self.edit_catalog)):
+            if not catalog.entries:
+                continue
+            names = [entry.name for entry in catalog.registered()]
+            logger.info(
+                f"[moss_image] {label} LoRA 目录 {len(catalog.entries)} 条，已注册: {names or '无'}"
+            )
 
     async def terminate(self) -> None:
         task = getattr(self, "_retry_task", None)
@@ -499,25 +599,36 @@ class MossImagePlugin(Star):
     # ------------------------------------------------------------------ #
     @filter.command("edit", alias={"改图", "编辑图片", "修图", "mossedit"})
     async def edit_command(self, event: AstrMessageEvent):
-        """按文字指令修改图片（Moss-Image-Edit）。用法：发图 + /edit 把背景换成晴天海边"""
+        """按文字指令修改图片（Moss-Image-Edit）。用法：发图 + /edit 把背景换成晴天海边 [--ref 1,2]"""
         if not self.settings.edit_enabled:
             yield event.plain_result("改图功能已在插件配置中关闭")
             return
         if not await self._permitted(event):
             return
         raw = self._strip_command(event.message_str)
-        images, image_warnings = await self._collect_images(event, self.settings.edit_max_images)
+        spec, cleaned = _split_ref_argument(raw)
+        images, image_warnings = await self._resolve_references(
+            event, spec, self.settings.edit_max_images
+        )
         if not images:
+            pool, _ = await self._image_pool(event)
+            if pool and spec:
+                yield event.plain_result(
+                    f"🖼️ 参考图编号无效。{self._image_inventory(event, len(pool))} "
+                    "用法：/edit 指令 --ref 1,2"
+                )
+                return
             yield event.plain_result(
                 "🖼️ 没找到要修改的图片：请把图片和 /edit 指令一起发送，"
                 "或引用（回复）一张图片后再发 /edit 指令"
             )
             return
-        request = parse_draw_request(raw.strip())
+        request = parse_draw_request(cleaned.strip())
         if not request.text:
             yield event.plain_result(
                 "✏️ 请说明要怎么改\n例如：/edit 把背景换成晴天的海边，保留人物\n"
-                "可选：--size 1024x1024 --steps 12 --seed 7 --no low quality --enhance"
+                "多图：/edit 把第 2 张的外套穿到第 1 张身上 --ref 1,2\n"
+                "可选：--ref 1,2 --size 1024x1024 --steps 12 --seed 7 --no low quality --enhance"
             )
             return
         if not await self._check_cooldown(event):
@@ -622,28 +733,35 @@ class MossImagePlugin(Star):
         self,
         event: AstrMessageEvent,
         prompt: str,
+        images: str = "",
         size: str = "",
         steps: int = -1,
         seed: int = -1,
         negative_prompt: str = "",
+        lora: str = "",
         enhance: bool = False,
     ):
-        """按文字指令修改用户发来或引用（回复）的图片，并把结果直接发给用户。
+        """按文字指令修改图片，支持多张参考图，并把结果直接发给用户。
 
         使用场景（命中任意一条就应调用）：
-        - 用户发送/引用了一张图片，并要求改动它：「把背景换成…」「换成夏装」「变成夜景」
+        - 用户发送/引用了一张或多张图片，并要求改动其中内容：「把背景换成…」「换成夏装」「变成夜景」
         - 用户说「改一下」「修一下」「把这个换成…」「在这张图上加…」
-        - 用户想保留原图的人物/构图，只改变局部
+        - 用户想保留某张图的人物/构图，只改变局部，或想把 A 图的人物换到 B 图的场景里
 
-        参考图会自动从当前消息或引用消息里取，不需要你传图片。
-        每次改图要几十秒；成功后图片已发给用户，你只需一句话简短回应。
+        多参考图：用 images 参数按编号指定，例如「1,2」表示第 1 张和第 2 张按此顺序传入；
+        编号从「可用参考图」里数（先本条消息的图片，再引用消息里的图片）。数量可达上限见配置。
+        不传 images 时默认使用全部可用参考图。指令里要写清每张图承担什么角色。
+
+        每次改图要十几秒到一分钟；成功后图片已发给用户，你只需一句话说明改了什么。
 
         Args:
-            prompt(string): 编辑指令，写清「改什么」与「保留什么」，例如「把背景换成晴天的海边，保留人物和姿势」
-            size(string): 输出尺寸，如 1024x1024；留空则按参考图比例自动决定
+            prompt(string): 编辑指令，写清「改什么」与「保留什么」，例如「把第2张图的外套穿到第1张图的角色身上，保留站姿和背景」
+            images(string): 参考图编号，逗号分隔（如 "1,2"）；也可填图片 URL；留空=用全部可用图片
+            size(string): 输出尺寸，如 1024x1024；留空则按第一张参考图比例自动决定
             steps(int): 采样步数，-1 使用服务端默认值（通常 12-20）
-            seed(int): 随机种子，-1 表示随机
+            seed(int): 随机种子，-1 表示随机；固定 seed 可在同一张图上反复微调
             negative_prompt(string): 额外排除的内容
+            lora(string): 叠加的 LoRA，格式「名称:权重」，多个用逗号；只在需要强化风格时使用
             enhance(bool): 是否先用提示词 skill 把指令改写成更精确的编辑指令
         """
         if not self.settings.edit_enabled:
@@ -651,8 +769,16 @@ class MossImagePlugin(Star):
         if not await self._permitted(event, quiet=True):
             return "改图权限受限。"
 
-        images, warnings = await self._collect_images(event, self.settings.edit_max_images)
-        if not images:
+        pool, _ = await self._image_pool(event)
+        images_bytes, warnings = await self._resolve_references(
+            event, images, self.settings.edit_max_images
+        )
+        if not images_bytes:
+            if pool:
+                return (
+                    f"参考图编号无效。{self._image_inventory(event, len(pool))} "
+                    "请用 images 参数按编号选择，或不传 images 使用全部。"
+                )
             return "没有找到可用的图片：请让用户把图片和指令一起发送，或引用一张图片后再试。"
 
         request = parse_draw_request("")
@@ -667,6 +793,9 @@ class MossImagePlugin(Star):
         if seed is not None and int(seed) >= 0:
             request.seed = int(seed)
         request.negative = (negative_prompt or "").strip()
+        if lora.strip():
+            parsed = parse_draw_request(f"x --lora {lora.strip()}")
+            request.loras = parsed.loras
         request.mode = "caption" if enhance else "raw"
 
         try:
@@ -713,6 +842,18 @@ class MossImagePlugin(Star):
         skill_guide = self.skill.guide() if self.settings.skill_guidance else ""
         if skill_guide:
             guidance += "\n\n" + skill_guide
+        edit_guide = ""
+        if self.settings.edit_enabled and self.settings.edit_skill_guidance:
+            edit_guide = self.edit_skill.edit_guide()
+            if edit_guide:
+                guidance += "\n\n" + edit_guide
+        if self.settings.edit_enabled:
+            guidance += (
+                "\n\n【改图参考图】改图时如果消息里有多张图片，用 moss_edit_image 的 images 参数"
+                "按编号指定（1 是第一条消息里的第一张，随后是引用消息里的图片），例如 images=\"1,2\"；"
+                "指令里要写清每张图承担什么角色（人物 / 服装 / 场景 / 风格）。"
+                "不传 images 表示使用全部可用图片。"
+            )
         if self.catalog.allow_bot_choice and self.catalog.entries:
             guidance += (
                 "\n\n【可用 LoRA】调用 moss_draw_image 时用 lora 参数选择，"
@@ -720,6 +861,18 @@ class MossImagePlugin(Star):
                 f"{self.catalog.brief()}\n"
                 "选择规则：只有当用户的要求与某条描述明显匹配时才启用它，并给出你判断的权重；"
                 "不匹配就不要启用，避免风格漂移。「默认启用」的条目已自动生效，无需再次指定。"
+            )
+        if (
+            self.settings.edit_enabled
+            and self.edit_catalog.allow_bot_choice
+            and self.edit_catalog.entries
+        ):
+            guidance += (
+                "\n\n【改图可用 LoRA】调用 moss_edit_image 时可用 lora 参数叠加风格 LoRA，"
+                f"格式「名称:权重」（权重 0~{self.edit_catalog.max_weight:g}）。"
+                "下面这些只作用于改图，与绘图 LoRA 是两份独立清单：\n"
+                f"{self.edit_catalog.brief()}\n"
+                "编辑以「贴合参考图」为先：除非用户明确要求某种风格，否则不要叠加 LoRA。"
             )
         current = getattr(request, "system_prompt", "") or ""
         if guidance in current:
@@ -758,38 +911,145 @@ class MossImagePlugin(Star):
                 pass
         return width, height, steps, guidance
 
-    async def _collect_images(self, event: AstrMessageEvent, limit: int) -> tuple[list[bytes], list[str]]:
-        """Images from the current message, falling back to the quoted message."""
+    async def _image_pool(self, event: AstrMessageEvent) -> tuple[list[tuple[str, object]], list[str]]:
+        """Every image the user made available, in a stable order.
+
+        Order matters because the model, the ``--ref`` flag and the tool's
+        ``images`` argument all address references by position:
+        images attached to the current message first (left to right), then
+        images from the quoted message.
+        """
         warnings: list[str] = []
-        components: list = []
+        pool: list[tuple[str, object]] = []
+        seen: set[str] = set()
+
+        def add(label: str, component) -> None:
+            key = str(getattr(component, "url", "") or getattr(component, "file", "")
+                      or getattr(component, "path", ""))
+            if key and key in seen:
+                return
+            if key:
+                seen.add(key)
+            pool.append((label, component))
+
         for component in event.get_messages() or []:
             if isinstance(component, Image) and (component.url or component.file or component.path):
-                components.append(component)
-        if not components:
-            reply = next(
-                (item for item in (event.get_messages() or []) if type(item).__name__ == "Reply"),
-                None,
-            )
+                add(f"第{len(pool) + 1}张（本条消息）", component)
+
+        reply = next(
+            (item for item in (event.get_messages() or []) if type(item).__name__ == "Reply"),
+            None,
+        )
+        if reply is not None:
             try:
                 from astrbot.core.utils.quoted_message.extractor import extract_quoted_message_images
 
                 for reference in await extract_quoted_message_images(event, reply):
-                    components.append(Image(file=str(reference)))
+                    component = Image(file=str(reference))
+                    add(f"第{len(pool) + 1}张（引用消息）", component)
             except Exception as error:  # noqa: BLE001 - optional AstrBot internal helper
                 logger.debug(f"[moss_image] 引用图片解析失败: {error}")
+        return pool, warnings
+
+    async def _component_bytes(self, component) -> bytes:
+        encoded = await component.convert_to_base64()
+        return base64.b64decode(encoded)
+
+    async def _fetch_remote_image(self, url: str) -> bytes:
+        """Download a reference the model passed explicitly (URL / file / base64)."""
+        text = url.strip()
+        if text.startswith("base64://"):
+            return base64.b64decode(text[len("base64://") :])
+        if text.startswith("file://"):
+            return await asyncio.to_thread(Path(text[len("file://") :]).read_bytes)
+        if text.startswith(("http://", "https://")):
+            import aiohttp
+
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(text) as response:
+                    if response.status != 200:
+                        raise ValueError(f"HTTP {response.status}")
+                    if len(await response.read()) > 20 * 1024 * 1024:
+                        raise ValueError("图片超过 20 MB")
+                async with session.get(text) as response:
+                    return await response.read()
+        path = Path(text)
+        if path.is_file():
+            return await asyncio.to_thread(path.read_bytes)
+        raise ValueError("无法识别的图片引用")
+
+    async def _resolve_references(
+        self, event: AstrMessageEvent, spec: str, limit: int
+    ) -> tuple[list[bytes], list[str]]:
+        """Turn a selector into reference bytes.
+
+        ``spec`` is what the model (or ``--ref``) asked for:
+
+        * empty - every image available, up to ``limit`` (the default)
+        * ``1,2`` / ``1 2`` - images by 1-based position in the pool
+        * URLs, ``file://`` paths or ``base64://`` payloads - fetched directly
+        * a mix of the above, kept in the given order
+        """
+        limit = max(1, limit)
+        warnings: list[str] = []
+        tokens = [token for token in re.split(r"[\s,，、;；]+", (spec or "").strip()) if token]
+        if not tokens:
+            pool, pool_warnings = await self._image_pool(event)
+            warnings.extend(pool_warnings)
+            if len(pool) > limit:
+                warnings.append(f"只取前 {limit} 张参考图")
+            images: list[bytes] = []
+            for _, component in pool[:limit]:
+                try:
+                    images.append(await self._component_bytes(component))
+                except Exception as error:  # noqa: BLE001 - report, keep the rest
+                    warnings.append(f"读取图片失败（{type(error).__name__}）")
+            return images, warnings
+
+        pool: list[tuple[str, object]] = []
         images: list[bytes] = []
-        for component in components[: max(1, limit)]:
+        for token in tokens:
+            if len(images) >= limit:
+                warnings.append(f"最多 {limit} 张参考图，已忽略多余部分")
+                break
+            if token.isdigit():
+                if not pool:
+                    pool, _ = await self._image_pool(event)
+                index = int(token)
+                if not 1 <= index <= len(pool):
+                    warnings.append(f"没有第 {index} 张图（可用 {len(pool)} 张）")
+                    continue
+                try:
+                    images.append(await self._component_bytes(pool[index - 1][1]))
+                except Exception as error:  # noqa: BLE001
+                    warnings.append(f"读取第 {index} 张图失败（{type(error).__name__}）")
+                continue
             try:
-                encoded = await component.convert_to_base64()
-                images.append(base64.b64decode(encoded))
+                images.append(await self._fetch_remote_image(token))
             except Exception as error:  # noqa: BLE001 - report, keep the rest
-                warnings.append(f"读取图片失败（{type(error).__name__}）")
-        if len(components) > limit:
-            warnings.append(f"只取前 {limit} 张参考图")
+                warnings.append(f"无法获取参考图 {token[:40]}（{error}）")
         return images, warnings
 
+    async def _collect_images(self, event: AstrMessageEvent, limit: int) -> tuple[list[bytes], list[str]]:
+        """Backwards-compatible wrapper: all available images, up to ``limit``."""
+        return await self._resolve_references(event, "", limit)
+
+    def _image_inventory(self, event: AstrMessageEvent, pool_size: int) -> str:
+        """One-line description of the available references for the model."""
+        if pool_size <= 0:
+            return "当前消息与引用消息里都没有图片。"
+        labels = []
+        for index in range(1, pool_size + 1):
+            labels.append(f"{index}")
+        return f"可用参考图：{pool_size} 张（编号 {'/'.join(labels)}，按出现顺序）"
+
     async def _render_edit(
-        self, event: AstrMessageEvent, request: DrawRequest, images: list[bytes], warnings: list[str]
+        self,
+        event: AstrMessageEvent,
+        request: DrawRequest,
+        images: list[bytes],
+        warnings: list[str],
     ) -> list:
         warnings = list(warnings) + list(request.warnings)
         prompt = request.text
@@ -809,8 +1069,14 @@ class MossImagePlugin(Star):
             if rewrite.warning:
                 warnings.append(rewrite.warning)
 
+        if self._needs_registration():
+            await self._register_catalog()
+        weights, lora_warnings = self.edit_catalog.resolve(request.loras)
+        warnings.extend(lora_warnings)
+
         logger.info(
             f"[moss_image] edit {len(images)} ref(s) steps={request.steps or 'auto'} "
+            f"loras={ {k: v for k, v in weights.items() if v > 0} or 'none'} "
             f"prompt={prompt[:120]!r}"
         )
         outcome = await self.client.edit(
@@ -823,11 +1089,14 @@ class MossImagePlugin(Star):
             guidance=request.guidance,
             seed=request.seed,
             shift=self.settings.shift,
+            loras={name: weight for name, weight in weights.items() if weight > 0},
             timeout=self.settings.timeout,
         )
-        return self._build_edit_components(outcome, warnings)
+        return self._build_edit_components(outcome, warnings, weights)
 
-    def _build_edit_components(self, outcome: EditOutcome, warnings: list[str]) -> list:
+    def _build_edit_components(
+        self, outcome: EditOutcome, warnings: list[str], weights: dict[str, float] | None = None
+    ) -> list:
         components: list = [Plain("🖌️ 改图完成")]
         image = Image.fromBytes(outcome.data)
         try:
@@ -843,6 +1112,9 @@ class MossImagePlugin(Star):
                 bits.append(f"{outcome.steps} 步")
             if outcome.references > 1:
                 bits.append(f"{outcome.references} 张参考图")
+            active = [f"{name} {weight:g}" for name, weight in (weights or {}).items() if weight > 0]
+            if active:
+                bits.append("LoRA " + "、".join(active))
             if outcome.seed is not None:
                 bits.append(f"seed {outcome.seed}")
             if outcome.seconds:

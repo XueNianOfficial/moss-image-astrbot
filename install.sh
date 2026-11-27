@@ -131,6 +131,17 @@ else
         || warn "clone failed; the plugin will fall back to the raw prompt"
 fi
 
+# The editing skill ships with this repo (MIT), so it is copied rather than cloned.
+EDIT_SKILL_SRC="$ROOT/skills/moss-image-edit/SKILL.md"
+if [ -f "$EDIT_SKILL_SRC" ]; then
+    EDIT_SKILL_DIR="$(dirname "$SKILL_DIR")/moss-image-edit-skill"
+    mkdir -p "$EDIT_SKILL_DIR"
+    cp "$EDIT_SKILL_SRC" "$EDIT_SKILL_DIR/SKILL.md"
+    ok "edit skill: $EDIT_SKILL_DIR/SKILL.md"
+else
+    warn "edit skill not found in the repo (skills/moss-image-edit/SKILL.md)"
+fi
+
 step 6/8 "Writing config.toml"
 CONFIG="$ROOT/config.toml"
 [ -f "$CONFIG" ] && cp "$CONFIG" "$CONFIG.bak-$(date +%Y%m%d-%H%M%S)" && warn "previous config backed up"

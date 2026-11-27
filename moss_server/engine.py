@@ -77,6 +77,8 @@ class EditRequest:
     seed: int | None = None
     shift: float | None = None
     uncond_skip_layers: tuple[int, ...] | None = None
+    #: Extra registered LoRAs stacked with the edit LoRA: {name: weight}.
+    loras: dict[str, float] | None = None
     progress: ProgressCallback | None = None
 
 
@@ -532,6 +534,28 @@ class MossEngine:
                 else self.config.edit_uncond_skip_layers
             )
 
+    def edit_loras(self, requested: dict[str, float] | None) -> list[dict]:
+        """Edit LoRA first, then the registry LoRAs the caller asked for.
+
+        The edit LoRA itself is not a catalog entry: it is fused on demand and
+        always applied at its trained strength.  Extra LoRAs ride along in the
+        same hook stack, so a style LoRA can be combined with editing.
+        """
+        stack: list[dict] = []
+        extras = dict(self.config.edit_loras or {})
+        for name, weight in (requested or {}).items():
+            if name not in self.loras:
+                raise ValueError(
+                    f"LoRA not registered: {name} (POST /v1/loras/load first)"
+                )
+            extras[name] = weight
+        for name, weight in extras.items():
+            entry = self.loras.get(name) if hasattr(self.loras, "get") else None
+            if entry is None:
+                raise ValueError(f"LoRA not registered: {name}")
+            stack.append({"path": entry.path, "strength": float(weight)})
+        return stack
+
     def edit(self, request: EditRequest) -> GeneratedImage:
         """Edit reference images on the already loaded model."""
         with self.lock:
@@ -542,6 +566,7 @@ class MossEngine:
                 raise ValueError(
                     f"at most {limit} reference images are supported, got {len(request.references)}"
                 )
+            extras = self.edit_loras(request.loras)
             started = time.perf_counter()
             self.ensure_loaded()
             lora = self.edit_lora_path()
@@ -564,7 +589,9 @@ class MossEngine:
                 for index, path in enumerate(request.references):
                     key = "ctrl_img" if index == 0 else f"ctrl_img_{index}"
                     sample[key] = str(path)
-                model = self._model_spec([{"path": str(lora), "strength": 1.0}])
+                model = self._model_spec(
+                    [{"path": str(lora), "strength": 1.0}, *extras]
+                )
                 job = self.engine.submit(model, sample, {"latents": "none"})
                 self._wait(job, request.progress)
                 image = self._collect(job, seed)

@@ -130,6 +130,44 @@ def build_plugin(provider: FakeProvider, extra_config: dict | None = None) -> Mo
     return plugin
 
 
+def _lora_config() -> dict:
+    """Draw catalog (kemono default-off @0.4) plus a separate edit catalog (@0.6).
+
+    A real LoRA path is borrowed from the live plugin config when it exists, so
+    the registration check exercises the server; otherwise a placeholder is
+    used and the resolve assertions are skipped.
+    """
+    real = _live_lora_path() or "G:/loras/kemono.safetensors"
+    return {
+        "lora": {"catalog_lines": f"kemono | {real} | off | 0.4 | 兽系风格"},
+        "edit_lora": {"catalog_lines": f"kemono | {real} | on | 0.6 | 改图时的兽系风格"},
+    }
+
+
+def _live_lora_path() -> str:
+    import json
+
+    config = Path(os.environ.get("USERPROFILE", "")) / ".astrbot/data/config/astrbot_plugin_moss_image_config.json"
+    try:
+        data = json.loads(config.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ""
+    for line in str((data.get("lora") or {}).get("catalog_lines") or "").replace(";", "\n").splitlines():
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) >= 2 and Path(parts[1]).is_file():
+            return parts[1].replace("\\", "/")
+    return ""
+
+
+def _write_temp_png(data: bytes) -> str:
+    import tempfile
+
+    handle = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    handle.write(data)
+    handle.close()
+    return handle.name
+
+
 def _texts(components) -> list[str]:
     return [part.text for part in components if isinstance(part, Plain)]
 
@@ -289,6 +327,75 @@ async def run() -> int:
     assert len(collected) == 1 and collected[0][:8] == sample[:8], (len(collected), warnings)
     print(f"  image collect  : {len(collected)} image(s), {len(collected[0])} bytes")
 
+    # 12b. Reference selection: the bot addresses images by position, so a
+    #      multi-image message must yield them in order and honour "2,1" / URLs.
+    first = _sample_image_bytes()
+    second = _sample_image_bytes((128, 64, 32))
+    three_events = FakeEvent([BotImage.fromBytes(first), BotImage.fromBytes(second)])
+    picked, _ = await plugin._resolve_references(three_events, "2,1", 4)
+    assert len(picked) == 2, picked
+    assert picked[0][:8] != picked[1][:8] or len(picked[0]) != len(picked[1])
+    ordered, _ = await plugin._resolve_references(three_events, "1", 4)
+    assert ordered[0][:8] == first[:8]
+    single, _ = await plugin._resolve_references(three_events, "2", 4)
+    assert single[0] == second
+    allrefs, _ = await plugin._resolve_references(three_events, "", 4)
+    assert len(allrefs) == 2
+    bad, bad_warnings = await plugin._resolve_references(three_events, "5", 4)
+    assert not bad and any("没有第 5 张" in item for item in bad_warnings), bad_warnings
+    local, _ = await plugin._resolve_references(three_events, str(_write_temp_png(second)), 4)
+    assert local[0] == second
+    print(
+        f"  ref selection  : 2 images, order honoured, {len(bad_warnings)} warning(s) on bad index"
+    )
+
+    # 12c. The editing skill is bundled with the repo and must be discoverable.
+    edit_info = plugin.edit_skill.info()
+    if edit_info.available:
+        assert edit_info.name == "moss-image-edit-skill", edit_info.name
+        assert edit_info.sections, "no ## N. sections parsed"
+        assert "图像编辑规范" in plugin.edit_skill.edit_guide()
+        request_obj = types.SimpleNamespace(
+            system_prompt="", func_tool=types.SimpleNamespace(names=lambda: ["moss_edit_image"])
+        )
+        await plugin._inject_tool_guidance(image_event, request_obj)
+        assert "图像编辑规范" in request_obj.system_prompt, request_obj.system_prompt[-300:]
+        assert "images" in request_obj.system_prompt
+        print(
+            f"  edit skill     : {edit_info.name} v{edit_info.version} "
+            f"{edit_info.chars} chars, {len(edit_info.sections)} sections"
+        )
+    else:
+        print("  edit skill     : skipped (no SKILL.md on this machine)")
+
+    # 12d. Draw and edit LoRA catalogs are separate and addressable by the bot.
+    plugin = build_plugin(FakeProvider(CAPTION), extra_config=_lora_config())
+    draw_entry = plugin.catalog.get("kemono")
+    edit_entry = plugin.edit_catalog.get("kemono")
+    assert draw_entry and edit_entry, "both catalogs should be parsed"
+    assert draw_entry.weight == 0.4 and draw_entry.enabled is False, draw_entry
+    assert edit_entry.weight == 0.6 and edit_entry.enabled is True, edit_entry
+    assert "kemono" in plugin.edit_catalog.brief()
+    draw_names = {entry.name for entry in plugin.catalog.entries}
+    edit_names = {entry.name for entry in plugin.edit_catalog.entries}
+    assert draw_names == edit_names == {"kemono"}
+
+    # With a live server the entries register and resolve into request weights.
+    await plugin._register_catalog()
+    if edit_entry.registered:
+        edit_weights, _ = plugin.edit_catalog.resolve(None)
+        assert edit_weights.get("kemono") == 0.6, edit_weights
+        boosted, _ = plugin.edit_catalog.resolve({"kemono": 0.2})
+        assert boosted.get("kemono") == 0.2, boosted
+        draw_weights, _ = plugin.catalog.resolve(None)
+        assert draw_weights.get("kemono") == 0.0, draw_weights  # default-off in draw mode
+        print(
+            f"  lora catalogs  : draw 0.4/off, edit 0.6/on, resolved "
+            f"draw={draw_weights.get('kemono')} edit={edit_weights.get('kemono')}"
+        )
+    else:
+        print("  lora catalogs  : draw/edit weights parsed (server offline, resolve skipped)")
+
     if os.environ.get("MOSS_TEST_EDIT") == "1":
         request = parse_draw_request("把背景换成晴天的海边，保留角色 --size 768x768 --steps 8 --seed 5")
         outcome = await plugin._render_edit(image_event, request, collected, [])
@@ -302,12 +409,12 @@ async def run() -> int:
     return 0
 
 
-def _sample_image_bytes() -> bytes:
+def _sample_image_bytes(colour=(24, 32, 48)) -> bytes:
     from io import BytesIO
 
     from PIL import Image, ImageDraw
 
-    image = Image.new("RGB", (768, 768), (24, 32, 48))
+    image = Image.new("RGB", (768, 768), colour)
     draw = ImageDraw.Draw(image)
     draw.ellipse((200, 160, 560, 520), fill=(210, 210, 220))
     draw.ellipse((300, 300, 340, 340), fill=(200, 40, 60))

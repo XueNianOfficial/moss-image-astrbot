@@ -46,6 +46,8 @@ class EditRequest:
     seed: int | None = None
     shift: float | None = None
     max_edge: int | None = None
+    #: Extra LoRAs to stack with the edit LoRA: {name: weight}.
+    loras: dict[str, float] | None = None
     progress: ProgressCallback | None = field(default=None, repr=False)
 
 
@@ -165,6 +167,7 @@ class EditService:
                 guidance_scale=request.guidance_scale,
                 seed=request.seed,
                 shift=request.shift,
+                loras=request.loras,
                 progress=request.progress,
             )
             try:

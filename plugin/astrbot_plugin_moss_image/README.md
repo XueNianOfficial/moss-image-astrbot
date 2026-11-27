@@ -11,7 +11,10 @@
 
 - 本机 MOSS-Image 服务（本仓库的服务端），默认监听 `http://127.0.0.1:8000`
   （装过开机自启会自动拉起；手动启动服务端目录下的 `run.ps1` / `run.bat`）
-- 改图需要服务端配好 `edit_adapter`（编辑 LoRA），与文生图共用 ai-toolkit 引擎
+- 改图需要服务端配好 `edit_adapter`（编辑 LoRA），与文生图共用同一个已加载模型
+- 多参考图：bot 用 `moss_edit_image` 的 `images` 参数按编号（`"1,2"`）或 URL 指定
+- 改图 LoRA 单独配置：配置页「改图 LoRA」是独立清单，默认启用的条目只作用于改图
+- 改图 skill：`skills/moss-image-edit/SKILL.md`（MIT），安装脚本会复制到 AstrBot 的 skills 目录
 - 提示词 skill 放在 `~/.astrbot/data/skills/moss-image-prompt-skill/SKILL.md`
 - 无额外 Python 依赖（仅用 AstrBot 自带的 aiohttp）
 
